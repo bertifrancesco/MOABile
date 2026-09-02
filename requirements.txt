@@ -1,0 +1,5 @@
+# 6.2 and not 1.0, which is what this said and never ran: the compact key
+# bar arrived in 6.2, and 6.1 refuses Footer(compact=True) outright. The
+# suite passes on 6.2 and on the current release.
+textual>=6.2
+pyte

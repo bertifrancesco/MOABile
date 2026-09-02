@@ -1,0 +1,14 @@
+# The code is written to 100 columns. Without this ruff assumes 88 and wants
+# every import list and f-string in here broken across lines, which is the
+# only thing it has to say about them.
+line-length = 100
+
+[lint]
+# The 100 above is only a formatting hint unless the line is also checked.
+extend-select = ["E501"]
+
+[lint.per-file-ignores]
+# The fake tools in here are shell scripts inside strings and the codeshare
+# fixtures are HTML: a wrapped line is a different program, or a different
+# page. Every line of python in the file is written to the 100 above.
+"test_moabile.py" = ["E501"]
