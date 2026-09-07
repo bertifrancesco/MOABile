@@ -562,7 +562,8 @@ case "$*" in
              # `list` is the user's own apps and nothing else.
              [[ "$*" == *--all* || "$*" == *list_all* ]] && {{
                echo "com.apple.mobilesafari, \\"Safari\\", \\"MobileSafari\\", \\"/Applications/MobileSafari.app\\""
-               echo "com.apple.Maps, \\"Maps\\", \\"Maps\\", \\"/Applications/Maps.app\\""; }}
+               echo "com.apple.Maps, \\"Maps\\", \\"Maps\\", \\"/Applications/Maps.app\\""
+               [[ -f "{TMP}/ios-trollstore" ]] && echo "com.opa334.TrollStore, \\"TrollStore\\", \\"TrollStore\\", \\"/var/containers/Bundle/Application/TS-TS/TrollStore.app\\""; }}
              exit 0;;
   *install*) [[ -f "{TMP}/badipa" ]] && {{ echo "ERROR: APIInternalError"; exit 0; }}
              [[ -f "{TMP}/unsigned" ]] && {{
@@ -1101,6 +1102,31 @@ async def test_edge_cases() -> None:
 
     ios.mob.push_screen_wait = lambda scr: _async_str("invalid/login")
     await ios.set_login()
+
+    ios.package = None
+    assert await ios.dir_holding("/var/plists") == ""
+
+    # Prefix collision: grep regex must target the exact package identifier
+    calls: list[str] = []
+    ios.package = "app.com.1"
+    ios.run = lambda cmd, **kw: (calls.append(cmd), _async_tuple((0, "/var/containers/Bundle/Application/AA/App.app/Info.plist\n")))[1]  # type: ignore[assignment]
+    res = await ios.dir_holding("/var/plists")
+    assert res == "/var/containers/Bundle/Application/AA/App.app", res
+    assert len(calls) == 1
+    assert "app\\.com\\.1([^A-Za-z0-9_.-]|$)" in calls[0], calls[0]
+
+    # Real plist grep test (both binary and XML formats) with prefix collision
+    import plistlib
+    f_short = Path(TMP) / "short.plist"
+    f_long = Path(TMP) / "long.plist"
+    for fmt in (plistlib.FMT_BINARY, plistlib.FMT_XML):
+        f_short.write_bytes(plistlib.dumps({"CFBundleIdentifier": "app.com.1"}, fmt=fmt))
+        f_long.write_bytes(plistlib.dumps({"CFBundleIdentifier": "app.com.1.test"}, fmt=fmt))
+        pattern = f"{re.escape('app.com.1')}([^A-Za-z0-9_.-]|$)"
+        rc, out = await moabile.sh("sh", "-c", f"grep -lsE {shlex.quote(pattern)} {f_short} {f_long} 2>/dev/null")
+        assert rc == 0 and out.strip().splitlines() == [str(f_short)], (fmt, out)
+    f_short.unlink(missing_ok=True)
+    f_long.unlink(missing_ok=True)
 
     ios.run = lambda *a, **kw: _async_tuple((1, "some grep error"))
     await ios.dir_holding("/var/plists")
@@ -2824,28 +2850,31 @@ async def phase_ios(app, pilot) -> None:
         (TMP / "battery-log").read_text()
     print("PASS the ios stats line is one usbmux call and one ssh round trip")
 
-    # One source for the app list, and the user's own apps only: `list`
-    # without --all, the half the android side asks for with -3. frida-ps
-    # would name every com.apple.* on top of it — and asked blind it does not
-    # fail, it waits out its whole timeout, which is a panel that hangs on
-    # opening.
+    # All applications listed (--all / list_all) so that TrollStore apps
+    # (registered as system apps) appear, with com.apple.* filtered out.
     assert await settle(pilot, lambda: ios.packages == ["com.target.ios"]), ios.packages
     installer = (TMP / "installer-log").read_text()
-    assert "--all" not in installer and "list_all" not in installer, installer
+    assert "--all" in installer or "list_all" in installer, installer
     assert "CFBundleExecutable" in installer, installer
-    # And the command line before `list` existed: -l, three fixed columns, and
-    # no way to ask for the executable or the bundle path. Guessing the wrong
-    # shape is a sidebar with nothing in it.
+    # And the command line before `list` existed: -l -o list_all, three fixed columns.
     moabile._HELP[("ideviceinstaller", "--install")] = True
     (TMP / "installer-log").write_text("")
     await ios.load_packages()
-    assert (TMP / "installer-log").read_text().strip().endswith(" -l"), \
+    assert "list_all" in (TMP / "installer-log").read_text(), \
         (TMP / "installer-log").read_text()
     assert ios.packages == ["com.target.ios"], ios.packages
     assert not ios.executables and not ios.bundles, (ios.executables, ios.bundles)
     del moabile._HELP[("ideviceinstaller", "--install")]
     await ios.load_packages()                    # back to the current shape
     assert ios.executables["com.target.ios"] == "Target", ios.executables
+
+    # TrollStore app test: non-Apple system app is preserved, while Apple apps are dropped
+    (TMP / "ios-trollstore").touch()
+    await ios.load_packages()
+    assert "com.opa334.TrollStore" in ios.packages, ios.packages
+    assert "com.apple.mobilesafari" not in ios.packages, ios.packages
+    (TMP / "ios-trollstore").unlink()
+    await ios.load_packages()
     # And the line when nothing comes back at all, which is the same answer the
     # android side gives when pm lists nothing: check that the tool reaches it.
     (TMP / "ios-noapps").touch()
@@ -3804,6 +3833,20 @@ async def main() -> None:
     assert moabile.pid_of([" 1234 /Applications/Target.app/Target"], "Target") == "1234"
     assert moabile.pid_of([" 1234 /Applications/TargetHelper.app/TargetHelper"], "Target") is None
     assert moabile.pid_of([" 1234 /Applications/Target.app/Target"], "") is None
+    # Apps sharing the same executable name (e.g. AppStable, App-Beta, AppAlpha)
+    ps_shared = [
+        " 1001 /private/var/containers/Bundle/Application/UUID-STABLE/AppStable.app/AppExecutable",
+        " 2002 /private/var/containers/Bundle/Application/UUID-BETA/App-Beta.app/AppExecutable",
+        " 3003 /private/var/containers/Bundle/Application/UUID-ALPHA/AppAlpha.app/AppExecutable",
+    ]
+    b_stable = "/var/containers/Bundle/Application/UUID-STABLE/AppStable.app"
+    b_beta = "/var/containers/Bundle/Application/UUID-BETA/App-Beta.app"
+    b_alpha = "/var/containers/Bundle/Application/UUID-ALPHA/AppAlpha.app"
+    assert moabile.pid_of(ps_shared, "AppExecutable", b_stable) == "1001"
+    assert moabile.pid_of(ps_shared, "AppExecutable", b_beta) == "2002"
+    assert moabile.pid_of(ps_shared, "AppExecutable", b_alpha) == "3003"
+    assert moabile.pid_of([ps_shared[0], ps_shared[2]], "AppExecutable", b_beta) is None
+    assert moabile.pid_of([ps_shared[1]], "AppExecutable", b_stable) is None
     assert moabile.last_line("") == ""
     assert moabile.last_line("  first\n  second  \n\n") == "second"
     assert moabile.not_there("sh: open: not found") is True
@@ -4084,7 +4127,7 @@ async def main() -> None:
     assert not [n for n in left if not n.startswith(".") and n != "__pycache__"], left
 
     strays: list[str] = []
-    for _ in range(20):
+    for _ in range(40):
         _, alive = await moabile.sh("pgrep", "-af", str(TMP))
         strays = [ln for ln in alive.splitlines() if ln.strip() and "pgrep" not in ln]
         if not strays and moabile.port_free(moabile.IOS_SSH_PORT):

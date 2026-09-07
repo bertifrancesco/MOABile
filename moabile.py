@@ -65,7 +65,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 # What --help says. There are no options to document: everything this does is
 # chosen inside, with the keys. Printed rather than built with argparse, which
 # would be a dependency's worth of machinery for a program that takes nothing.
@@ -530,15 +530,23 @@ def is_package(ident: str) -> bool:
         and "." in ident and ".." not in ident
 
 
-def pid_of(lines: list[str], exe: str) -> str | None:
-    """The pid running `exe`, out of `ps -o pid,comm` lines.
+def pid_of(lines: list[str], exe: str, bundle: str = "") -> str | None:
+    """The pid running `exe` (inside `bundle` if known), out of `ps -o pid,comm` lines.
 
     The executable's own path and nothing shorter: an app called Target is not
     the TargetHelper beside it, and a name matched anywhere in the line found
-    the pid of whatever had it as an argument.
+    the pid of whatever had it as an argument. Where a bundle path is known,
+    the match is pinned to that directory so that two apps sharing an executable
+    name (such as a release build and a beta build of the same app) do not
+    read as the same process.
     """
     if not exe:
         return None
+    if bundle:
+        b = bundle.removeprefix("/private").rstrip("/")
+        b_clean = b.removeprefix("/var/jb")
+        pat = rf"\s*(\d+)\s+(?:/private)?(?:/var/jb)?{re.escape(b_clean)}/{re.escape(exe)}$"
+        return next((m.group(1) for line in lines if (m := re.match(pat, line.rstrip()))), None)
     return next((m.group(1) for line in lines
                  if (m := re.match(rf"\s*(\d+)\s+\S*/{re.escape(exe)}$", line.rstrip()))),
                 None)
@@ -2962,6 +2970,7 @@ class IosPanel(DevicePanel):
         # The executable the selected app runs as, and the app it was looked
         # up for — None until the first lookup: see package_chosen().
         self.proc_name = ""
+        self.proc_bundle = ""
         self._proc_for: str | None = None
         # The ssh multiplexing master and the password that opened it. Kept in
         # memory for as long as the panel is open and written nowhere: a
@@ -3433,22 +3442,22 @@ class IosPanel(DevicePanel):
         printed three fixed columns and had no way to ask, which is the split
         installer_takes_commands() reads.
 
-        The user's own apps and nothing else, which is what `list` answers with
-        when `--all` is left off — the same half the android side asks for with
-        -3. frida-ps would name the system's own on top of it, and a sidebar
-        holding every com.apple.* is not what any of this is pointed at.
+        The apps on the phone are queried with all types (--all / list_all),
+        so that apps installed through TrollStore (which iOS registers as System
+        applications) are included. Built-in Apple apps (com.apple.*) are filtered
+        out so the sidebar is not flooded with system utilities.
         """
         # Annotated: the two command lines answer with a different number of
         # columns, and the branch below is the whole reason this is read at all.
         columns: tuple[str, ...]
         if await installer_takes_commands():
             columns = IOS_APP_ATTRS
-            args = ["list"]
+            args = ["list", "--all"]
             for attr in columns:
                 args += ["-a", attr]
         else:
             columns = IOS_APP_COLUMNS
-            args = ["-l"]
+            args = ["-l", "-o", "list_all"]
         _, out = await sh("ideviceinstaller", "-u", self.serial, *args, timeout=90)
         # "com.foo.bar, "1.0", "Foo"" — the quotes are the tool's own, and the
         # first line it prints is the column names.
@@ -3457,8 +3466,10 @@ class IosPanel(DevicePanel):
         for line in out.splitlines():
             row = dict(zip(columns, (p.strip().strip('"') for p in line.split(", "))))
             # is_package drops the tool's own header row along with anything
-            # that is not an identifier: neither has a dot in it.
-            if not is_package(ident := row.get("CFBundleIdentifier", "")):
+            # that is not an identifier: neither has a dot in it. Apple's own
+            # bundles are dropped so the sidebar is not flooded with system apps.
+            if not is_package(ident := row.get("CFBundleIdentifier", "")) \
+                    or ident == "com.apple" or ident.startswith("com.apple."):
                 continue
             found.add(ident)
             # The display name is listed and not kept: what an app is called on
@@ -3527,7 +3538,7 @@ class IosPanel(DevicePanel):
             # iOS runs an app as the executable inside its bundle, not as its
             # bundle id: the name is resolved once in package_chosen(), and the
             # process table already fetched above carries its full path.
-            "pid": pid_of(s.get("ps", []), self.proc_name) or "-",
+            "pid": pid_of(s.get("ps", []), self.proc_name, self.proc_bundle) or "-",
         }
 
     async def address(self, s: dict[str, list[str]]) -> str:
@@ -3611,7 +3622,7 @@ class IosPanel(DevicePanel):
         return None
 
     async def package_chosen(self) -> None:
-        """Find the executable the app runs as, for the pid in the stats line.
+        """Find the executable and bundle the app runs as, for the pid in the stats line.
 
         Off the app list where the installer gave it, which is instant and
         needs nothing on the phone. Failing that the glob grep behind
@@ -3620,11 +3631,15 @@ class IosPanel(DevicePanel):
         three seconds.
         """
         self._proc_for = self.package or ""
+        self.proc_bundle = self.bundles.get(self.package or "") or ""
+        if not self.proc_bundle and self.package:
+            self.proc_bundle = await self.bundle_dir()
         if executable := self.executables.get(self.package or ""):
             self.proc_name = executable
-            return
-        bundle = await self.bundle_dir() if self.package else ""
-        self.proc_name = bundle.rsplit("/", 1)[-1].removesuffix(".app") if bundle else ""
+        elif self.proc_bundle:
+            self.proc_name = self.proc_bundle.rsplit("/", 1)[-1].removesuffix(".app")
+        else:
+            self.proc_name = ""
         if self.package and not self.proc_name:
             self.write(f"[yellow]{escape(self.package)}: no bundle on this phone"
                        " — no pid and no log filter; pick it again to look once more")
@@ -3824,7 +3839,7 @@ class IosPanel(DevicePanel):
         if self._proc_for != (self.package or ""):
             await self.package_chosen()
         _, out = await self.run(IOS_PS, root=False)
-        return pid_of(out.splitlines(), self.proc_name)
+        return pid_of(out.splitlines(), self.proc_name, self.proc_bundle)
 
     async def server_bytes(self) -> int | None:
         """The server's size, but only with the agent there beside it.
@@ -3890,8 +3905,11 @@ class IosPanel(DevicePanel):
         grep on the phone, and a phone that has not got it would otherwise
         answer exactly like one where the app is not installed.
         """
+        if not self.package:
+            return ""
+        pattern = f"{re.escape(self.package)}([^A-Za-z0-9_.-]|$)"
         rc, out = await self.run(
-            f"grep -ls {shlex.quote(self.package or '')} {plists} 2>/dev/null",
+            f"grep -lsE {shlex.quote(pattern)} {plists} 2>/dev/null",
             timeout=120, root=False)
         found = [ln.strip() for ln in out.splitlines() if ln.strip().endswith(".plist")]
         # grep is the one thing here that has to be on the phone, and a
@@ -3921,13 +3939,16 @@ class IosPanel(DevicePanel):
         """
         if path := self.bundles.get(self.package or ""):
             return path
-        return await self.dir_holding(
+        found = await self.dir_holding(
             "/var/containers/Bundle/Application/*/*.app/Info.plist"
             " /Applications/*.app/Info.plist"
             # Only where it is a second place to look: on a rootful jailbreak
             # jb is empty and this is the line above written twice, which is
             # one more sweep of every Info.plist on the phone for nothing.
             + (f" {self.jb}/Applications/*.app/Info.plist" if self.jb else ""))
+        if self.package and found:
+            self.bundles[self.package] = found
+        return found
 
     async def data_dir(self) -> str:
         """The app's Data container, which is not the bundle it was installed from.
