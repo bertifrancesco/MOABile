@@ -25,6 +25,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 from textual import events
 
@@ -963,7 +964,7 @@ async def test_edge_cases() -> None:
     assert await dp.frida_blocker() is None
     assert dp.summary() == ""
     assert dp.cpu == "?"
-    assert moabile.VERSION == "1.1.0"
+    assert moabile.VERSION == "1.1.1"
 
     # Log filter edge cases: case-insensitivity, history retention, regex escaping
     dp.log_history.clear()
@@ -1088,8 +1089,10 @@ async def test_edge_cases() -> None:
     await ap.cat_out("/sdcard/test.txt", str(TMP))
     orig_sh = moabile.sh
     moabile.sh = lambda *a, **kw: _async_tuple((124, "timed out"))
-    await ap.cat_out("/sdcard/test.txt", str(TMP))
-    moabile.sh = orig_sh
+    try:
+        await ap.cat_out("/sdcard/test.txt", str(TMP))
+    finally:
+        moabile.sh = orig_sh
     ap.package = "com.test.app"
     ap.adb = lambda *a, **kw: _async_tuple((1, ""))
     await ap.save_app(str(TMP))
@@ -1227,9 +1230,15 @@ async def test_edge_cases() -> None:
     assert (await ios.open_master("")) != ""
 
     ios.ssh_user = "root"
-    await ios.run("id", as_root=True)
-
+    # Restored first: ios.run is still the line-1185 stub here, which swallows
+    # any keyword and would hide a wrong one (`root`, not `as_root`) for good.
+    # master_up mocked before calling it for real: this ios is a standalone
+    # object nothing ever tears down, and the real one opens a genuine usb
+    # tunnel on a real local port that would then sit there for the rest of
+    # the run, taking IOS_SSH_PORT away from the ios panel phase_ios opens.
+    ios.run = moabile.IosPanel.run.__get__(ios, moabile.IosPanel)
     ios.master_up = lambda: _async_bool(False)
+    await ios.run("id", root=True)
     ios.pull = moabile.IosPanel.pull.__get__(ios, moabile.IosPanel)
     assert (await ios.scp("l", "r"))[0] != 0
     assert (await ios.pull("r", "l"))[0] != 0
@@ -3083,14 +3092,13 @@ async def phase_ios(app, pilot) -> None:
     assert "--all" in installer or "list_all" in installer, installer
     assert "CFBundleExecutable" in installer, installer
     # And the command line before `list` existed: -l -o list_all, three fixed columns.
-    moabile._HELP[("ideviceinstaller", "--install")] = True
-    (TMP / "installer-log").write_text("")
-    await ios.load_packages()
-    assert "list_all" in (TMP / "installer-log").read_text(), \
-        (TMP / "installer-log").read_text()
-    assert ios.packages == ["com.target.ios"], ios.packages
-    assert not ios.executables and not ios.bundles, (ios.executables, ios.bundles)
-    del moabile._HELP[("ideviceinstaller", "--install")]
+    with patch.dict(moabile._HELP, {("ideviceinstaller", "--install"): True}):
+        (TMP / "installer-log").write_text("")
+        await ios.load_packages()
+        assert "list_all" in (TMP / "installer-log").read_text(), \
+            (TMP / "installer-log").read_text()
+        assert ios.packages == ["com.target.ios"], ios.packages
+        assert not ios.executables and not ios.bundles, (ios.executables, ios.bundles)
     await ios.load_packages()                    # back to the current shape
     assert ios.executables["com.target.ios"] == "Target", ios.executables
 
@@ -4081,11 +4089,10 @@ async def main() -> None:
     assert moabile.not_there("Success") is False
     assert moabile.first({"sec": ["foo 123 bar"]}, "sec", r"foo (\d+) bar") == "123"
     assert moabile.first({}, "sec") is None
-    moabile._HELP[("ideviceinstaller", "--install")] = True
-    assert await moabile.installer_takes_commands() is False
-    moabile._HELP[("ideviceinstaller", "--install")] = False
-    assert await moabile.installer_takes_commands() is True
-    del moabile._HELP[("ideviceinstaller", "--install")]
+    with patch.dict(moabile._HELP, {("ideviceinstaller", "--install"): True}):
+        assert await moabile.installer_takes_commands() is False
+        moabile._HELP[("ideviceinstaller", "--install")] = False
+        assert await moabile.installer_takes_commands() is True
 
     parsed = moabile.sections("@batt\n  level: 87\n@load\n0.4 0.3\n@frida\n")
     assert parsed == {"batt": ["  level: 87"], "load": ["0.4 0.3"], "frida": []}, parsed
@@ -4191,11 +4198,10 @@ async def main() -> None:
 
     # libusbmuxd 2.0 changed iproxy's argument order, so both shapes are
     # spelled out here: guessing wrong is a tunnel that never comes up.
-    moabile._HELP[("iproxy", "--udid")] = True
-    assert await moabile.iproxy_argv(2222, "UDID") == ["iproxy", "2222:22", "-u", "UDID"]
-    moabile._HELP[("iproxy", "--udid")] = False
-    assert await moabile.iproxy_argv(2222, "UDID") == ["iproxy", "2222", "22", "UDID"]
-    del moabile._HELP[("iproxy", "--udid")]          # let the fake answer again
+    with patch.dict(moabile._HELP, {("iproxy", "--udid"): True}):
+        assert await moabile.iproxy_argv(2222, "UDID") == ["iproxy", "2222:22", "-u", "UDID"]
+        moabile._HELP[("iproxy", "--udid")] = False
+        assert await moabile.iproxy_argv(2222, "UDID") == ["iproxy", "2222", "22", "UDID"]
 
     # A .deb is parsed here rather than shelled out to dpkg, so what is not one
     # has to come back as an error and not as half an unpacked tree.

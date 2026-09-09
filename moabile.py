@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import csv
 import fcntl
 import io
 import os
@@ -75,7 +76,7 @@ from textual.widgets import (
     TextArea,
 )
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 # What --help says. There are no options to document: everything this does is
 # chosen inside, with the keys. Printed rather than built with argparse, which
 # would be a dependency's worth of machinery for a program that takes nothing.
@@ -143,7 +144,7 @@ IOS_APP_COLUMNS = ("CFBundleIdentifier", "CFBundleVersion", "CFBundleDisplayName
 # every command IosPanel.run sends, and inside sudo as well as outside it:
 # sudo replaces the PATH it is given with its own secure_path.
 IOS_PATH = ("export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
-            ":/var/jb/usr/sbin:/var/jb/usr/bin:/var/jb/sbin;")
+            ":/var/jb/usr/sbin:/var/jb/usr/bin:/var/jb/sbin:/var/jb/bin;")
 # Status polls between one battery reading and the next. It is a fresh usbmux
 # connection each time, for a number that does not move in three seconds.
 BATTERY_TICKS = 10
@@ -1451,6 +1452,17 @@ class FileList(Vertical):
         item = self.query_one(ListView).highlighted_child
         return item.value if isinstance(item, ValueItem) and item.value else None
 
+    def is_dir(self, name: str) -> bool:
+        """Whether `name` is a directory in the listing already on screen.
+
+        Off the listing, not a fresh stat: `mv` onto an existing directory
+        moves the source inside it rather than renaming — the opposite of
+        what an "overwrite" confirmation promised — and the listing already
+        knows which entries are directories without another round trip.
+        """
+        want = f"{name.rstrip('/')}/"
+        return any(item.value == want for item in self.query_one(ListView).query(ValueItem))
+
     @work(group="listing", exclusive=True)
     async def reload(self) -> None:
         self.post_message(self.Moved())
@@ -1517,9 +1529,15 @@ class HostList(FileList):
             # As a context manager: an entry that raises part way through
             # otherwise leaves the directory handle open until a collection.
             with os.scandir(self.path) as entries:
-                names = [f"{e.name}/" if e.is_dir() else e.name for e in entries
-                         if e.is_dir() or e.name.endswith(self.suffix)]
-        except OSError as exc:             # gone, or not ours to read
+                names = []
+                for e in entries:
+                    try:
+                        is_dir = e.is_dir()
+                    except OSError:         # one bad entry (ELOOP, ESTALE, ...)
+                        continue            # is not the rest of the directory
+                    if is_dir or e.name.endswith(self.suffix):
+                        names.append(f"{e.name}/" if is_dir else e.name)
+        except OSError as exc:             # the directory itself: gone, or not ours to read
             return 1, str(exc)
         return 0, "\n".join(names)
 
@@ -1781,6 +1799,10 @@ class FilesScreen(ModalScreen[None]):
         # somewhere else entirely, which is not what the question asked.
         if "/" in name:
             self.notify("a name, not a path: this renames in place", severity="warning")
+            return
+        if side.is_dir(name):
+            self.notify(f"{name} is a directory here — rename would move the file"
+                        " inside it, not overwrite it", severity="warning")
             return
         if await side.exists(name) and not await self.app.push_screen_wait(ConfirmScreen(
             f"overwrite {name} on {self.side_name(side)}?", "overwrite", "cancel",
@@ -2496,13 +2518,17 @@ class DevicePanel(Vertical):
             self.write("[dim]frida-server stopped")
         await self.refresh_stats()
 
-    async def do_purge(self, verbose: bool = True, log_prefix: str = "removed") -> bool:
-        """Stop frida-server and delete it, so the device keeps nothing of ours."""
+    def junk_files(self) -> str:
+        """Every path a frida-server install of ours may have left behind."""
         extra_junk = f"{self.jb}/usr/lib/frida-1.0" if hasattr(self, "jb") else ""
         detected = getattr(self, "_detected_server_path", None)
-        junk = " ".join(dict.fromkeys(
+        return " ".join(dict.fromkeys(
             filter(None, (self.server_path, detected, self.server_junk, extra_junk))
         ))
+
+    async def do_purge(self, verbose: bool = True, log_prefix: str = "removed") -> bool:
+        """Stop frida-server and delete it, so the device keeps nothing of ours."""
+        junk = self.junk_files()
         if pid := await self.frida_pid():
             if verbose:
                 self.write(f"kill    {self.server_path} (pid {pid})")
@@ -2529,11 +2555,7 @@ class DevicePanel(Vertical):
         would recognise. Putting it back costs one push from the cache, so
         leaving nothing behind is cheap enough to be worth a key of its own.
         """
-        extra_junk = f"{self.jb}/usr/lib/frida-1.0" if hasattr(self, "jb") else ""
-        detected = getattr(self, "_detected_server_path", None)
-        junk = " ".join(dict.fromkeys(
-            filter(None, (self.server_path, detected, self.server_junk, extra_junk))
-        ))
+        junk = self.junk_files()
         if not await self.mob.push_screen_wait(ConfirmScreen(
                 f"take frida-server off {self.serial}",
                 f"stop it and delete {junk}",
@@ -2613,6 +2635,8 @@ class DevicePanel(Vertical):
             rc, out = await self.push(str(local), remote)
             if rc != 0:
                 self.fail(f"push failed: {out.strip()}")
+                # do not leave a server with no agent beside it, or vice versa
+                await self.do_purge(verbose=False)
                 return False
             await self.run(f"chmod 755 {shlex.quote(remote)}")
         self._detected_server_path = None
@@ -3353,9 +3377,12 @@ class IosPanel(DevicePanel):
         if self.master_said:      # asked already and refused: do not ask every poll
             return False
         async with self.master_lock:
-            # Someone else may have opened it while this call waited its turn.
+            # Someone else may have opened it, or already been refused, while
+            # this call waited its turn — recheck both before asking again.
             if self.master and self.master.poll() is None:
                 return True
+            if self.master_said:
+                return False
             if not (said := await self.open_master(self.password)):
                 self.master_said = False
                 return True
@@ -3519,6 +3546,14 @@ class IosPanel(DevicePanel):
             if tunnel.poll() is not None or port_listening(self.ssh_port):
                 break
             await asyncio.sleep(0.1)
+        else:
+            # Never bound and never exited either: reported as up before this
+            # check, ssh then failed against a port nothing was listening on
+            # yet, with an error that named the wrong end of the problem.
+            if self.tunnel is tunnel:
+                return self.no_tunnel(f"iproxy did not start listening on port"
+                                      f" {self.ssh_port} in time")
+            return False
         # The local, and then whether it is still the panel's: a login changed
         # with u or a panel closed while this waited, and drop_tunnel terminated
         # this very process and put None in its place. Reaching into
@@ -3749,8 +3784,11 @@ class IosPanel(DevicePanel):
         # first line it prints is the column names.
         found: set[str] = set()
         self.executables, self.bundles = {}, {}
-        for line in out.splitlines():
-            row = dict(zip(columns, (p.strip().strip('"') for p in line.split(", "))))
+        # csv, not a plain split on ", ": a quoted field (a display name such
+        # as "Words, Inc") contains that exact separator, and a blind split
+        # shifted every column after it.
+        for fields in csv.reader(out.splitlines(), skipinitialspace=True):
+            row = dict(zip(columns, (f.strip() for f in fields)))
             # is_package drops the tool's own header row along with anything
             # that is not an identifier: neither has a dot in it. Apple's own
             # bundles are dropped so the sidebar is not flooded with system apps.
@@ -4161,6 +4199,13 @@ class IosPanel(DevicePanel):
         )
         return size if rc == 0 else None
 
+    def _unpack_failed(self, unpacked: Path, msg: str, deb: Path | None = None) -> None:
+        """An unpacked cache dir this incomplete must not be reused as "cached"."""
+        shutil.rmtree(unpacked, ignore_errors=True)
+        if deb is not None:
+            deb.unlink(missing_ok=True)
+        self.fail(msg)
+
     async def server_files(self, ver: str, arch: str) -> list[tuple[Path, str]] | None:
         """The two files out of frida's iOS package, unpacked on the host.
 
@@ -4185,9 +4230,7 @@ class IosPanel(DevicePanel):
             try:
                 inside = await asyncio.to_thread(unpack_deb, deb, unpacked)
             except (OSError, ValueError, tarfile.TarError) as exc:
-                shutil.rmtree(unpacked, ignore_errors=True)
-                deb.unlink(missing_ok=True)
-                self.fail(f"{deb.name}: {exc}")
+                self._unpack_failed(unpacked, f"{deb.name}: {exc}", deb)
                 return None
             self.write(f"unpack  {len(inside)} files from [b]{deb.name}[/]")
         else:
@@ -4198,13 +4241,15 @@ class IosPanel(DevicePanel):
         if not server_local.is_file():
             server_local = next(unpacked.rglob("frida-server"), None)
         if not server_local or not server_local.is_file():
-            self.fail(f"{deb.name} did not contain frida-server")
+            # Left as-is, an unpack interrupted partway through repeats this
+            # same failure on every retry, with no unpack ever tried again.
+            self._unpack_failed(unpacked, f"{deb.name} did not contain frida-server", deb)
             return None
 
         # Find frida-agent.dylib in unpacked (handles both frida/ and frida-1.0/)
         agent_local = next(unpacked.rglob("frida-agent.dylib"), None)
         if not agent_local or not agent_local.is_file():
-            self.fail(f"{deb.name} did not contain frida-agent.dylib")
+            self._unpack_failed(unpacked, f"{deb.name} did not contain frida-agent.dylib", deb)
             return None
 
         # Build remote agent path preserving directory structure
@@ -4487,6 +4532,10 @@ class MOABile(App):
         self.waiting: list[tuple[str, str]] = []
         self._active: DevicePanel | None = None
         self._ticking = False
+        # Serials with an open_or_close() in flight: a second toggle of the same
+        # row before the first finishes mounting must not race it, while a
+        # different device's toggle must not be blocked by it.
+        self._toggling: set[str] = set()
         # What the package list is currently showing, and the pending redraw
         # of it: see show_packages().
         self._drawn: tuple = ()
@@ -4688,9 +4737,15 @@ class MOABile(App):
             await self.refresh_devices()
             # Concurrently: serial refreshes made each extra device add its own
             # round-trip delay to every tick.
-            # return_exceptions: one device failing must not stop the others.
-            await asyncio.gather(*(p.refresh_stats() for p in self.panels),
-                                 return_exceptions=True)
+            # return_exceptions: one device failing must not stop the others,
+            # but it must still say so — silently dropped it read as a panel
+            # that quietly stopped updating, indistinguishable from a dead one.
+            panels = self.panels
+            results = await asyncio.gather(*(p.refresh_stats() for p in panels),
+                                           return_exceptions=True)
+            for p, result in zip(panels, results):
+                if isinstance(result, Exception):
+                    p.fail(f"stats: {result}")
         finally:
             self._ticking = False
 
@@ -4779,10 +4834,19 @@ class MOABile(App):
     @work(exclusive=True, group="rescan")
     async def action_rescan(self) -> None:
         """Scan for attached devices and refresh package lists on open panels."""
-        await self.refresh_devices()
-        for p in self.panels:
-            await p.load_packages()
-        self.sync_sidebar()
+        # Shares poll()'s own flag: refresh_devices() shuts down and removes a
+        # panel for anything unplugged, and the periodic poll running the same
+        # call at the same moment raced it into a double remove() on one panel.
+        while self._ticking:
+            await asyncio.sleep(0.05)
+        self._ticking = True
+        try:
+            await self.refresh_devices()
+            for p in self.panels:
+                await p.load_packages()
+            self.sync_sidebar()
+        finally:
+            self._ticking = False
 
     async def toggle_panel(self, serial: str) -> None:
         if state := dict(self.waiting).get(serial):
@@ -4909,7 +4973,15 @@ class MOABile(App):
 
     @work(group="panel")
     async def open_or_close(self, serial: str) -> None:
-        await self.toggle_panel(serial)
+        # Per-serial, not exclusive on the group: two different devices toggle
+        # independently, only a second toggle of the *same* serial is dropped.
+        if serial in self._toggling:
+            return
+        self._toggling.add(serial)
+        try:
+            await self.toggle_panel(serial)
+        finally:
+            self._toggling.discard(serial)
 
     @on(ListView.Selected, "#packages")
     def package_selected(self, event: ListView.Selected) -> None:
@@ -5255,27 +5327,34 @@ class MOABile(App):
         if panel := self.target():
             await panel.set_login()
 
+    def _clipboard_via(self, cmd: list[str], text: str) -> None:
+        """Run a clipboard helper with input on stdin, never hanging the app.
+
+        Off the event loop, in a worker thread: a helper that blocks (a
+        headless X11 with no clipboard manager running is the usual way
+        xclip/xsel do) used to freeze the whole UI — every panel, all input —
+        for as long as it took to give up, timeout included.
+        """
+        with contextlib.suppress(Exception):
+            subprocess.run(cmd, input=text.encode("utf-8"), timeout=2, check=False)
+
     def copy_to_clipboard(self, text: str) -> None:
         """Copy text to clipboard via OSC 52, pbcopy (macOS), or Linux clipboard tools."""
         super().copy_to_clipboard(text)
         if sys.platform == "darwin":
-            with contextlib.suppress(Exception):
-                proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                proc.communicate(input=text.encode("utf-8"))
+            cmd = ["pbcopy"]
         elif shutil.which("wl-copy"):
-            with contextlib.suppress(Exception):
-                proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
-                proc.communicate(input=text.encode("utf-8"))
+            cmd = ["wl-copy"]
         elif shutil.which("xclip"):
-            with contextlib.suppress(Exception):
-                cmd = ["xclip", "-selection", "clipboard"]
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                proc.communicate(input=text.encode("utf-8"))
+            cmd = ["xclip", "-selection", "clipboard"]
         elif shutil.which("xsel"):
-            with contextlib.suppress(Exception):
-                cmd = ["xsel", "--clipboard", "--input"]
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                proc.communicate(input=text.encode("utf-8"))
+            cmd = ["xsel", "--clipboard", "--input"]
+        else:
+            return
+        # copy_to_clipboard is Textual's own sync override, called from key
+        # handlers — it cannot await, so the blocking helper above goes to a
+        # thread instead of running straight on the event loop.
+        self.run_worker(lambda: self._clipboard_via(cmd, text), thread=True)
 
     def action_clean(self) -> None:
         """Empty the active panel's log."""
