@@ -5407,13 +5407,15 @@ class MOABile(App):
         self.exit()
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str] | None = None) -> int:
     """The command line, which is a door and not a dashboard.
 
     A program that swallows arguments it does not understand and then paints
     the screen leaves you wondering which of the two you got wrong, so an
     argument it has no use for is an error with the usage under it.
     """
+    if argv is None:
+        argv = sys.argv[1:]
     if {"-h", "--help"} & set(argv):
         print(USAGE)
     elif {"-V", "--version"} & set(argv):
@@ -5427,4 +5429,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

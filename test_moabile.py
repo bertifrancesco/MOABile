@@ -4255,6 +4255,12 @@ async def main() -> None:
     with contextlib.redirect_stdout(said_out), contextlib.redirect_stderr(io.StringIO()):
         assert moabile.main(["--help"]) == 0 and moabile.main(["-V"]) == 0
         assert moabile.main(["--nope"]) == 2, "an unknown argument was swallowed"
+        orig_argv = sys.argv
+        try:
+            sys.argv = ["moabile", "-V"]
+            assert moabile.main() == 0, "main() without arguments should use sys.argv[1:]"
+        finally:
+            sys.argv = orig_argv
     assert "python3 moabile.py" in said_out.getvalue(), said_out.getvalue()
     assert moabile.VERSION in moabile.USAGE, moabile.USAGE
     print("PASS --help and --version answer, and a stray argument is an error")

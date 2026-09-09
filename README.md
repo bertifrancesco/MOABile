@@ -1,5 +1,6 @@
 # MOABile — mother of all mobile
 
+[![PyPI](https://img.shields.io/pypi/v/moabile.svg)](https://pypi.org/project/moabile/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20iOS-brightgreen.svg)](#)
@@ -39,17 +40,43 @@ the `PATH` a non-interactive ssh leaves out — `/usr/sbin`, and everything a
 rootless jailbreak keeps under `/var/jb` — inside `sudo` as well as outside it,
 so `grep` and `open` are not reported missing on a phone that has them.
 
-## Run
+## Installation & Run
 
-Two runtime dependencies, then run it as a normal script:
+### Recommended: `pipx` (Isolated CLI)
+
+The easiest and cleanest way to run MOABile without dependency conflicts or `externally-managed-environment` errors:
+
+```bash
+# Install globally in an isolated environment
+pipx install moabile
+
+# Run
+moabile
+```
+
+Or run it directly on the fly without permanent installation:
+
+```bash
+pipx run moabile
+```
+
+### Via `pip`
+
+```bash
+pip install moabile
+moabile
+```
+
+### From Source
+
+Clone the repository and install requirements:
 
 ```bash
 pip install -r requirements.txt
 python3 moabile.py
 ```
 
-On a distribution that manages its own Python (`error: externally-managed-environment`),
-put them in a virtualenv first:
+On distributions that manage their own Python (`error: externally-managed-environment`), use a virtualenv:
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate

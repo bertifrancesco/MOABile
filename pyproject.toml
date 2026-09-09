@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moabile"
+version = "1.1.1"
+description = "Mother of All Mobile — TUI for Android and iOS mobile app security assessment"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    {name = "Francesco Berti", email = "berti.francesco@proton.me"}
+]
+keywords = [
+    "frida",
+    "android",
+    "ios",
+    "mobile-security",
+    "pentesting",
+    "tui",
+    "terminal",
+    "textual"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+dependencies = [
+    "textual>=6.2",
+    "pyte",
+]
+
+[project.urls]
+Homepage = "https://github.com/bertifrancesco/MOABile"
+Documentation = "https://github.com/bertifrancesco/MOABile#readme"
+Repository = "https://github.com/bertifrancesco/MOABile"
+Issues = "https://github.com/bertifrancesco/MOABile/issues"
+
+[project.scripts]
+moabile = "moabile:main"
+
+[tool.setuptools]
+py-modules = ["moabile"]
