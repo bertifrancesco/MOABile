@@ -97,20 +97,22 @@ gate does not let you through — there would be nothing past it to do.
 | `b` | the side**b**ar, on and off | `u` | ssh **u**ser for this device |
 | `f` | **f**rida-server, on and off | `p` | **p**urge frida-server off the device |
 | `s` | **s**pawn the app under frida, or attach | `k` | clear this panel's log |
-| `o` | explore the app with **o**bjection | `v` | save an s**v**g of the interface |
-| `w` | mirror the screen in a **w**indow | `m` | dark/light **m**ode |
-| `t` | **t**erminal on the device | `h` | **h**elp: keys and widgets |
-| `l` | stream the device **l**og | `q` | **q**uit |
-| `d` | files: browse host ↔ device | `f8` | return focus from tool pane |
-| `a` | **a**dd an app: install an apk or ipa | | |
-| `e` | **e**xport the app's apk/ipa | | |
+| `o` | explore the app with **o**bjection | `/` | filter log stream by keyword |
+| `w` | mirror the screen in a **w**indow | `c` | **c**opy log / text viewer modal |
+| `t` | **t**erminal on the device | `v` | save an s**v**g of the interface |
+| `l` | stream the device **l**og | `m` | dark/light **m**ode |
+| `d` | files: browse host ↔ device | `h` | **h**elp: keys and widgets |
+| `a` | **a**dd an app: install an apk or ipa | `alt+c` | **c**opy terminal session / viewer |
+| `e` | **e**xport the app's apk/ipa | `f8` | return focus from tool pane |
+| `q`, `ctrl+q` | **q**uit | | |
 
 `s` spawns the app under frida, which is what a script that has to be in
 place before the app starts needs. Where the app is already running it offers
 to attach to it instead — the app keeps whatever state it is in, and a script
 on the running process sees what the device log does not carry: the unified
 log's debug and info entries never reach `idevicesyslog`. Enter and escape keep
-the spawn.
+the spawn. `f` toggles frida-server, offering to match the host client, keep
+what is installed, or install a specific custom version.
 
 An app that is off screen is suspended on iOS, and attaching to a suspended
 process is a prompt that never arrives — so `s` and `o` bring the app to the
@@ -126,6 +128,8 @@ comes with it — so the pid is applied here, on the bracket every syslog line
 carries after the process name. Which is why the whole-device-or-one-app
 question comes up only while the app is running: with no pid there is no
 filter to be had, so the stream is the whole device and the panel says why.
+`/` filters the active stream in real time by keyword, and `c` opens the
+accumulated log in a selectable viewer modal with native clipboard copy.
 
 Inside the file browser (`d`): `p` push host → device, `l` pull device → host, `a`
 jumps to the app's own data directory and `h` back to where the device side

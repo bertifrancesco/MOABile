@@ -216,7 +216,7 @@ def make_deb(path: Path) -> None:
     inner = io.BytesIO()
     with tarfile.open(fileobj=inner, mode="w:gz") as tar:
         for name in ("./var/jb/usr/sbin/frida-server",
-                     "./var/jb/usr/lib/frida-1.0/frida-agent.dylib"):
+                     "./var/jb/usr/lib/frida/frida-agent.dylib"):
             blob = b"FAKE-FRIDA-PAYLOAD" + os.urandom(700_000)
             info = tarfile.TarInfo(name)
             info.size, info.mode = len(blob), 0o755
@@ -622,6 +622,7 @@ os.chdir(TMP)
 
 from rich.console import Console
 from textual.app import App
+from textual.color import Color
 from textual.content import Content
 from textual.markup import MarkupError
 from textual.widgets import Input, Label, ListView, RichLog, Static
@@ -962,6 +963,34 @@ async def test_edge_cases() -> None:
     assert await dp.frida_blocker() is None
     assert dp.summary() == ""
     assert dp.cpu == "?"
+    assert moabile.VERSION == "1.1.0"
+
+    # Log filter edge cases: case-insensitivity, history retention, regex escaping
+    dp.log_history.clear()
+    dp.log_filter = "warning"
+    dp.write("info message")
+    dp.write("a WARNING message")
+    assert len(dp.log_history) == 2
+    dp.log_filter = "[crash+*]"
+    dp.write("[crash+*] occurred")
+    dp.write("crash message")
+    assert len(dp.log_history) == 4
+    dp.log_filter = ""
+
+    # TextViewerScreen actions
+    tv = moabile.TextViewerScreen("Title", "line1\nline2")
+    assert tv.title_text == "Title"
+    assert tv.content_text == "line1\nline2"
+    tv.dismiss = lambda r=None: setattr(tv, "_dismissed", True)
+    tv.action_dismiss_viewer()
+    assert getattr(tv, "_dismissed", False) is True
+
+    # TerminalPane pause on exit
+    tp = moabile.TerminalPane(dp)
+    assert tp.exited is None
+    tp.exited = 1
+    tp.on_key(events.Key("enter", "enter"))
+    assert tp.exited is None
 
     # Toggle frida when frida is up and kill fails with output
     dp.frida_pid = lambda: _async_str("9999")
@@ -996,15 +1025,40 @@ async def test_edge_cases() -> None:
 
     tfile = Path(TMP) / "dummy_local_test"
     tfile.write_text("x")
+    dp.mob.push_screen_wait = lambda s: _async_bool(True)
     dp.server_files = lambda v, a: _async_obj([(tfile, "/remote")])
     dp.push = lambda l, r: _async_tuple((1, "push failed"))
     assert await dp.ensure_frida() is False
 
     dp.push = lambda l, r: _async_tuple((0, "ok"))
-    dp.run = lambda c: _async_tuple((0, "ok"))
+    dp.run = lambda c, **kw: _async_tuple((0, "ok"))
     dp.launch_server = lambda w: _async_bool(False)
     assert await dp.ensure_frida() is False
     tfile.unlink(missing_ok=True)
+
+    # ensure_frida custom version choice when no server on device
+    dp.mob.push_screen_wait = lambda s: (
+        _async_str("c") if isinstance(s, moabile.ConfirmScreen)
+        else _async_str("16.2.1")
+    )
+    dp.server_files = lambda v, a: _async_none()
+    assert await dp.ensure_frida() is False
+
+    # launch_server testing: success, error log, and fallback
+    dp.launch_server = moabile.DevicePanel.launch_server.__get__(dp, moabile.DevicePanel)
+    dp.server_path = "/server"
+    dp.frida_pid = lambda: _async_str("5432")
+    assert await dp.launch_server("frida-server") is True
+
+    dp.frida_pid = lambda: _async_none()
+    dp.run = lambda c, **kw: (
+        _async_tuple((0, "Unable to bind to address: Address already in use"))
+        if "cat " in c else _async_tuple((0, "ok"))
+    )
+    assert await dp.launch_server("frida-server") is False
+
+    dp.run = lambda c, **kw: _async_tuple((0, ""))
+    assert await dp.launch_server("frida-server") is False
 
     # 8. warn_drift
     dp.warn_drift = moabile.DevicePanel.warn_drift.__get__(dp, moabile.DevicePanel)
@@ -1205,10 +1259,29 @@ async def test_edge_cases() -> None:
         moabile.unpack_deb = orig_unpack
         deb_p.unlink(missing_ok=True)
 
-    # CodeshareScreen reload
-    cs: Any = moabile.CodeshareScreen("test")
-    cs.load = lambda: None
-    cs.action_reload()
+    # Test copy_to_clipboard on MOABile
+    app_cli = moabile.MOABile()
+    app_cli.copy_to_clipboard("test_text")
+    assert app_cli._clipboard == "test_text"
+
+    # Test server_files with a deb having frida-1.0 layout
+    inner_tar = io.BytesIO()
+    with tarfile.open(fileobj=inner_tar, mode="w") as tar:
+        for fname in ("./var/jb/usr/sbin/frida-server", "./var/jb/usr/lib/frida-1.0/frida-agent.dylib"):
+            info = tarfile.TarInfo(fname)
+            info.size = 10
+            tar.addfile(info, io.BytesIO(b"0123456789"))
+    deb_17 = moabile.CACHE / "frida_17.17.0_iphoneos-arm64.deb"
+    deb_17.parent.mkdir(parents=True, exist_ok=True)
+    deb_17.write_bytes(b"!<arch>\n" + ar_member("data.tar", inner_tar.getvalue()))
+    unpacked_17 = moabile.CACHE / "frida-17.17.0-iphoneos-arm64"
+    shutil.rmtree(unpacked_17, ignore_errors=True)
+    files_17 = await ios.server_files("17.17.0", "arm64")
+    assert files_17 is not None
+    remotes = [r for _l, r in files_17]
+    assert any("frida-1.0/frida-agent.dylib" in r for r in remotes), remotes
+    deb_17.unlink(missing_ok=True)
+    shutil.rmtree(unpacked_17, ignore_errors=True)
 
     print("PASS edge cases: error paths, base classes, and process boundaries")
 
@@ -1476,6 +1549,19 @@ async def phase_sidebar_cost(app, pilot) -> None:
     select(lv, "com.target.app")
     assert await settle(pilot, lambda: b.package == "com.target.app"), b.package
 
+    # When focused, the selected package row has -highlight and -active; its label
+    # color must resolve to $background (dark) instead of $accent (orange), avoiding
+    # orange-on-orange invisible text.
+    active_row = next(r for r in lv.query(moabile.ValueItem) if r.value == "com.target.app")
+    assert active_row.has_class("-active")
+    lv.focus()
+    await pilot.pause()
+    bg_color = Color.parse(moabile.DARK.background)
+    assert active_row.query_one(moabile.Label).styles.color == bg_color
+    b.focus()
+    await pilot.pause()
+    assert active_row.query_one(moabile.Label).styles.color != bg_color
+
     # Every row is a widget mount, and a phone with a couple of hundred apps on
     # it paid that on every pause in the filter — the field lagged behind the
     # typing. The drawing is capped and the head says so; the count itself
@@ -1610,6 +1696,27 @@ async def phase_tools(app, pilot) -> None:
     assert "sh exited" in log_text(b), log_text(b)
     print("PASS terminal pane runs a program on a pty and forwards keys")
 
+    # A program that exits non-zero pauses the pane so errors can be inspected.
+    b.term.start(["sh", "-c", "echo 'fatal failure'; exit 2"])
+    assert await settle(pilot, lambda: b.term.exited == 2, tries=200), b.term.exited
+    assert b.term.running and b.has_class("running"), "pane closed instead of pausing on exit!=0"
+    assert "exited with code 2" in b.term.border_subtitle, b.term.border_subtitle
+    assert "fatal failure" in term_text(b), term_text(b)
+    # c copies the error output and opens TextViewerScreen
+    await pilot.press("c")
+    assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
+    assert "fatal failure" in app._clipboard
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), app.screen
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: not b.term.running), "pane did not close on keypress"
+    assert not b.has_class("running"), "panel stayed in running layout"
+    assert "exited with 2 — pane kept open to inspect error" in log_text(b), log_text(b)
+    # An intentional stop or ctrl-c (exit 130) closes cleanly without pausing
+    b.term.start(["sh", "-c", "exit 130"])
+    assert await settle(pilot, lambda: not b.term.running), "exit 130 paused instead of closing"
+    print("PASS terminal pane stays open on non-zero exit until dismissed")
+
     # The log is the panel and a tool opens under it: what was run stays
     # readable while the REPL is up, instead of scrolling away behind it.
     order = [type(child).__name__ for child in b.children]
@@ -1622,7 +1729,27 @@ async def phase_tools(app, pilot) -> None:
     await pilot.pause()
     print("PASS the log stays visible under a running tool")
 
+    # alt+c copies running terminal session without stopping the process
+    b.term.start(["sh", "-c", "echo 'active terminal session'; sleep 20"])
+    assert await settle(pilot, lambda: "active terminal session" in term_text(b)), term_text(b)
+    await pilot.press("alt+c")
+    assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
+    assert "active terminal session" in app._clipboard
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), \
+        app.screen
+    assert b.term.running, "alt+c stopped the running terminal"
+    # Scrollback history retains lines that scrolled off the visible screen
+    for i in range(50):
+        b.term.stream.feed(f"scrollback line {i}\r\n".encode())
+    history = b.term.get_history_text()
+    assert "scrollback line 0" in history and "scrollback line 49" in history, history
+    b.term.stop()
+    await pilot.pause()
+    print("PASS alt+c copies running terminal session and scrollback retains lines")
+
     app.action_objection()
+    await confirm(pilot, app, "y")
     assert await settle(pilot, lambda: b.term.argv[:1] == ["objection"], tries=300), b.term.argv
     assert (TMP / "monkey").exists(), "app was never started before attaching"
     # -g and explore are deprecated upstream; -n and start replace them. And -n
@@ -1708,8 +1835,16 @@ async def phase_tools(app, pilot) -> None:
     # settle, not a bare assert: focus goes through the message loop, so the
     # frame that sees the process running is not always the one holding it yet.
     assert await settle(pilot, lambda: b.term.has_focus), "the pane did not take the keyboard"
+    assert app.query_one("#barkey-b").display is False
+    assert app.query_one("#barkey-h").display is False
+    assert app.check_action("quit", ()) is False
+    assert app.check_action("copy_terminal", ()) is True
+    assert app.check_action("leave_terminal", ()) is True
     await pilot.press("f8")
     assert await settle(pilot, lambda: b.has_focus), app.focused
+    assert app.query_one("#barkey-b").display is True
+    assert app.query_one("#barkey-h").display is True
+    assert app.check_action("quit", ()) is not False
     assert b.term.running, "f8 killed the tool"
     await pilot.press("k")                   # an app key, now that it can land
     assert await settle(pilot, lambda: log_text(b) == ""), log_text(b)
@@ -2056,6 +2191,58 @@ async def phase_streams(app, pilot) -> None:
     assert log_text(a) != "", "k emptied the wrong panel"
     print("PASS k clears the active panel's log")
 
+    # / filters log stream by keyword and shows badge in stats
+    b.write("line one hello")
+    b.write("line two error occurred")
+    await pilot.press("slash")
+    assert await on_screen(pilot, app, moabile.AskScreen, tries=200), app.screen
+    app.screen.query_one("#answer", Input).value = "error"
+    await pilot.press("enter")
+    assert b.log_filter == "error"
+    assert "/error" in _stats(b), _stats(b)
+    # Clear filter with / and empty input
+    await pilot.press("slash")
+    assert await on_screen(pilot, app, moabile.AskScreen, tries=200), app.screen
+    app.screen.query_one("#answer", Input).value = ""
+    await pilot.press("enter")
+    assert b.log_filter == ""
+    assert "/error" not in _stats(b), _stats(b)
+    # Focusing sidebar package filter disables / filter_logs hotkey
+    pkg_input = app.query_one("#filter", Input)
+    pkg_input.focus()
+    await pilot.pause()
+    assert app.check_action("filter_logs", ()) is False
+    assert app.check_action("quit", ()) is False
+    assert app.query_one("#barkey-b").display is False
+    assert app.query_one("#barkey-h").display is False
+    b.focus()
+    await pilot.pause()
+    assert app.query_one("#barkey-b").display is True
+    assert app.query_one("#barkey-h").display is True
+    assert app.check_action("quit", ()) is not False
+    print("PASS / filters log stream by keyword and shows badge in stats")
+
+    # c opens log history in selectable read-only TextViewer modal
+    await pilot.press("c")
+    assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
+    area = app.screen.query_one(moabile.TextArea)
+    assert area.read_only is True
+    assert "line two error occurred" in area.text, area.text
+    # c in TextViewerScreen copies to clipboard
+    await pilot.press("c")
+    assert "line two error occurred" in app._clipboard
+    # ctrl+a selects all text
+    await pilot.press("ctrl+a")
+    assert area.selected_text == area.text
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), app.screen
+    # q also closes TextViewerScreen
+    await pilot.press("c")
+    assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
+    await pilot.press("q")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), app.screen
+    print("PASS c opens log history in selectable read-only TextViewer modal and copies to clipboard")
+
     # logcat is asked for whole or filtered every time it starts: a filter is
     # invisible once the stream is scrolling.
     await pilot.press("l")
@@ -2175,6 +2362,20 @@ async def phase_files(app, pilot) -> None:
         (host.path, device.path)
     host.go(str(TMP))
     assert await settle(pilot, lambda: host.path == str(TMP))
+
+    # In a directory with only one item, it must still be highlighted with the -highlight class
+    single_dir = TMP / "single_folder"
+    single_dir.mkdir(exist_ok=True)
+    (single_dir / "lone_file.txt").write_text("hello")
+    host.go(str(single_dir))
+    assert await settle(pilot, lambda: host.path == str(single_dir) and len(host_entries._nodes) == 1)
+    assert host_entries.children[0].has_class("-highlight"), "single item in directory did not receive -highlight class"
+    assert host_entries.highlighted_child is not None
+    assert host_entries.highlighted_child.value == "lone_file.txt"
+    host.go(str(TMP))
+    assert await settle(pilot, lambda: host.path == str(TMP) and any(n.value == "bin/" for n in host_entries._nodes))
+    shutil.rmtree(single_dir, ignore_errors=True)
+    print("PASS a directory with a single item highlights its lone element")
 
     # Enter on a device file pulls it to wherever the host side is standing.
     # Refused: the confirmation is not a formality, "n" has to stop it.
@@ -2574,7 +2775,15 @@ async def phase_frida_server(app, pilot) -> None:
     await b.refresh_stats()
     assert "9001" not in _stats(b), _stats(b)
 
-    await pilot.press("f")               # off -> install and start
+    await pilot.press("f")               # off -> prompt for install
+    assert await on_screen(pilot, app, moabile.ConfirmScreen, tries=200), app.screen
+    await pilot.press("n")               # cancel
+    assert await settle(pilot, lambda: not (TMP / "frida-up").exists(), tries=200), log_text(b)
+    assert "is up, pid 9001" not in log_text(b)
+
+    await pilot.press("f")               # off -> prompt for install
+    assert await on_screen(pilot, app, moabile.ConfirmScreen, tries=200), app.screen
+    await pilot.press("y")               # install client version
     assert await settle(pilot, lambda: "is up, pid 9001" in log_text(b), tries=200), log_text(b)
     install = log_text(b)
     assert str(cached) in install and "/data/local/tmp/frida-server" in install, install
@@ -2613,16 +2822,32 @@ async def phase_frida_server(app, pilot) -> None:
     assert await settle(pilot, lambda: (TMP / "adb-log").read_text().count("push ") > pushes,
                         tries=200), log_text(b)
     assert await settle(pilot, lambda: "is up, pid 9001" in log_text(b), tries=200), log_text(b)
+    assert "purge   /data/local/tmp/frida-server" in log_text(b), log_text(b)
     (TMP / "server-there").unlink()
     await pilot.press("f")               # leave it stopped for what follows
     assert await settle(pilot, lambda: not (TMP / "frida-up").exists(), tries=200), log_text(b)
     print("PASS y replaces the server on the device, n starts what is there")
+
+    # c on ConfirmScreen prompts for a custom version and installs it
+    (TMP / "server-there").touch()
+    await pilot.press("f")
+    assert await on_screen(pilot, app, moabile.ConfirmScreen, tries=200), app.screen
+    await pilot.press("c")
+    assert await on_screen(pilot, app, moabile.AskScreen, tries=200), app.screen
+    app.screen.query_one("#answer", Input).value = "16.5.9"
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: "frida-server 16.5.9 (arm64) is up" in log_text(b), tries=200), log_text(b)
+    (TMP / "server-there").unlink(missing_ok=True)
+    await pilot.press("f")               # stop it
+    assert await settle(pilot, lambda: not (TMP / "frida-up").exists(), tries=200), log_text(b)
+    print("PASS c allows installing a specific custom frida-server version")
 
     # A truncated download is an error page or a cut connection, never a
     # server; pushing it would fail obscurely on the device instead.
     cached.unlink(missing_ok=True)
     (TMP / "tiny").touch()
     await pilot.press("f")
+    await confirm(pilot, app, "y")
     assert await settle(pilot, lambda: "download failed" in log_text(b), tries=200), log_text(b)
     assert not cached.exists(), "a truncated download was kept"
     (TMP / "tiny").unlink()
@@ -2633,6 +2858,7 @@ async def phase_frida_server(app, pilot) -> None:
     stale = moabile.CACHE / "frida-server-16.0.1-android-arm64"
     stale.write_bytes(b"an older server")
     await pilot.press("f")
+    await confirm(pilot, app, "y")
     assert await settle(pilot, lambda: cached.exists(), tries=200), log_text(b)
     assert not stale.exists(), "an old frida-server was left in the cache"
     print("PASS the frida-server cache keeps one version, not every version")
@@ -2917,6 +3143,7 @@ async def phase_ios(app, pilot) -> None:
     shutil.rmtree(unpacked, ignore_errors=True)
     (TMP / "scp-log").write_text("")
     await pilot.press("f")
+    await confirm(pilot, app, "y")
     assert await settle(pilot, lambda: "is up, pid 9101" in log_text(ios), tries=300), log_text(ios)
     install = log_text(ios)
     # arm64e is an arm64 build: frida publishes no arm64e package.
@@ -2927,7 +3154,7 @@ async def phase_ios(app, pilot) -> None:
     assert "unpack  2 files" in install, install
     pushed = (TMP / "scp-log").read_text()
     assert "/usr/sbin/frida-server" in pushed, pushed
-    assert "/usr/lib/frida-1.0/frida-agent.dylib" in pushed, pushed
+    assert "/usr/lib/frida/frida-agent.dylib" in pushed, pushed
     assert (unpacked / "var/jb/usr/sbin/frida-server").is_file(), list(unpacked.rglob("*"))
     await ios.refresh_stats()
     assert "frida ● 9101" in _stats(ios), _stats(ios)
@@ -2948,14 +3175,14 @@ async def phase_ios(app, pilot) -> None:
     paths = await ios.server_files("16.5.9", "arm64")
     assert paths is not None and [remote for _local, remote in paths] == [
         "/var/jb/usr/sbin/frida-server",
-        "/var/jb/usr/lib/frida-1.0/frida-agent.dylib"], paths
-    assert ios.server_junk == "/var/jb/usr/lib/frida-1.0", ios.server_junk
+        "/var/jb/usr/lib/frida/frida-agent.dylib"], paths
+    assert ios.server_junk == "/var/jb/usr/lib/frida", ios.server_junk
     (TMP / "rootless").unlink()
     await ios.describe()
     assert ios.jb == "", ios.jb
     paths = await ios.server_files("16.5.9", "arm64")
     assert paths is not None and [remote for _local, remote in paths] == [
-        "/usr/sbin/frida-server", "/usr/lib/frida-1.0/frida-agent.dylib"], paths
+        "/usr/sbin/frida-server", "/usr/lib/frida/frida-agent.dylib"], paths
     print("PASS a rootless jailbreak puts frida under /var/jb, a rootful one at the root")
 
     await pilot.press("t")
@@ -3653,7 +3880,7 @@ async def phase_ios_login(app, pilot) -> None:
     # p takes the agent with the server: frida-server loads it from beside
     # itself, so one without the other is dead weight on the phone.
     junk = ios.server_junk
-    assert junk.endswith("/usr/lib/frida-1.0"), junk
+    assert junk.endswith("/usr/lib/frida"), junk
     (TMP / "ios-edits").write_text("")
     await pilot.press("p")
     await confirm(pilot, app, "y")
@@ -3662,7 +3889,7 @@ async def phase_ios_login(app, pilot) -> None:
     assert await settle(pilot, lambda: "rm -rf" in (TMP / "ios-edits").read_text(),
                         tries=300), (TMP / "ios-edits").read_text()
     edits = (TMP / "ios-edits").read_text()
-    assert "/usr/sbin/frida-server" in edits and "frida-1.0" in edits, edits
+    assert "/usr/sbin/frida-server" in edits and "/usr/lib/frida" in edits, edits
     print("PASS p takes the frida agent off the phone with the server")
 
     tunnel = ios.tunnel
@@ -3908,13 +4135,13 @@ async def main() -> None:
         list(Path(TMP).iterdir())
     # A binding naming an action that does not exist fails silently at runtime.
     for cls_screen in (moabile.MOABile, moabile.DepsScreen, moabile.FridaArgsScreen, moabile.ConfirmScreen,
-                       moabile.FilesScreen, moabile.ScriptScreen, moabile.CodeshareScreen):
+                       moabile.FilesScreen, moabile.ScriptScreen, moabile.CodeshareScreen, moabile.TextViewerScreen):
         for binding in cls_screen.BINDINGS:
             if isinstance(binding, moabile.Binding):
                 assert hasattr(cls_screen, f"action_{binding.action}"), (cls_screen.__name__, binding.action)
     app_bindings = [b for b in moabile.MOABile.BINDINGS if isinstance(b, moabile.Binding)]
     assert {b.key for b in app_bindings} == {
-        "r", "b", "f", "s", "o", "w", "t", "l", "d", "a", "e", "i", "u", "p", "k", "v",
+        "r", "b", "f", "s", "o", "w", "t", "l", "slash", "c", "alt+c", "f8", "d", "a", "e", "i", "u", "p", "k", "v",
         "m", "h", "q"}
     # A key that stands for nothing in the word beside it has to be memorised
     # twice, so the bar is built the other way round: the label is chosen to
@@ -3922,7 +4149,10 @@ async def main() -> None:
     # for files — and k for clear is the plain shell convention.
     off = [(b.key, b.description) for b in app_bindings
            if not b.description.startswith(b.key)]
-    assert off == [("b", "sidebar"), ("d", "files"), ("k", "clear"), ("v", "svg")], off
+    assert off == [
+        ("b", "sidebar"), ("slash", "log filter"), ("alt+c", "copy terminal"),
+        ("f8", "leave terminal"), ("d", "files"), ("k", "clear"), ("v", "svg"),
+    ], off
     # The bar has room for a word each, so the whole sentence lives in the
     # tooltip — which is what hovering a key and the h panel show.
     assert all(b.tooltip for b in app_bindings), \

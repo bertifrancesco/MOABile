@@ -44,7 +44,7 @@ import tempfile
 import termios
 from html import unescape
 from pathlib import Path
-from typing import ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 from urllib.parse import quote
 
 import pyte
@@ -63,9 +63,19 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.timer import Timer
 from textual.widget import Widget
-from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+    TextArea,
+)
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 # What --help says. There are no options to document: everything this does is
 # chosen inside, with the keys. Printed rather than built with argparse, which
 # would be a dependency's worth of machinery for a program that takes nothing.
@@ -115,7 +125,7 @@ IOS_PS = "ps -A -o pid,comm"
 # without it. The /var/jb prefix is the package's own — a rootful jailbreak
 # drops it.
 IOS_FRIDA_FILES = ("/var/jb/usr/sbin/frida-server",
-                   "/var/jb/usr/lib/frida-1.0/frida-agent.dylib")
+                   "/var/jb/usr/lib/frida/frida-agent.dylib")
 # What the app list is asked for, in the order the tool prints them. The
 # executable and the path are the two answers that otherwise cost a glob grep
 # on the phone — seconds on a phone with a few hundred apps, and nothing at all
@@ -676,7 +686,8 @@ class TerminalPane(Widget):
     # Every key belongs to the child process — ctrl+c has to reach frida — so
     # the one way back out is a key no REPL uses and this pane never forwards.
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("f8", "leave", "leave the pane", show=False),
+        Binding("alt+c", "copy_terminal", "copy", key_display="alt+c"),
+        Binding("f8", "leave_terminal", "leave", key_display="f8"),
     ]
 
     def __init__(self, panel: DevicePanel) -> None:
@@ -691,13 +702,14 @@ class TerminalPane(Widget):
         # without this a second keypress starts a second process and orphans the
         # first, whose pty nobody ever reads or closes.
         self.starting = False
+        self.exited: int | None = None
         self.vt: pyte.Screen | None = None
         self.stream: pyte.ByteStream | None = None
         self._styles: dict[tuple, Style] = {}
 
     @property
     def running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        return (self.proc is not None and self.proc.poll() is None) or self.exited is not None
 
     def start(self, cmd: list[str], label: str = "") -> None:
         """Run cmd in the pane, showing label for it.
@@ -736,7 +748,7 @@ class TerminalPane(Widget):
             self.panel.set_class(False, "running")
             return
         cols, rows = max(20, self.size.width or 80), max(5, self.size.height or 24)
-        self.vt = pyte.Screen(cols, rows)
+        self.vt = pyte.HistoryScreen(cols, rows, history=10000)
         self.stream = pyte.ByteStream(self.vt)
         try:
             # Its own controlling terminal: without one, job control and ctrl-c
@@ -749,11 +761,13 @@ class TerminalPane(Widget):
             return
         self.fd = master
         asyncio.get_running_loop().add_reader(master, self._readable)
-        self.panel.write(f"[dim]$ {self.label}   (f8 leaves the pane)")
+        self.panel.write(f"[dim]$ {self.label}   (alt+c copies, f8 leaves the pane)")
+        self.border_subtitle = " [bold cyan]alt+c: copy[/] · [dim]f8: leave pane[/] "
         self.focus()
 
     def stop(self) -> None:
         self.starting = False
+        self.exited = None
         if self.running and self.proc:
             reap(self.proc)
             if self.proc.poll() is None:      # ignored the terminate: insist
@@ -764,6 +778,8 @@ class TerminalPane(Widget):
         self._teardown()
 
     def _teardown(self) -> None:
+        was_paused = self.exited is not None
+        self.exited = None
         if self.fd is not None:
             with contextlib.suppress(RuntimeError, ValueError, OSError):
                 asyncio.get_running_loop().remove_reader(self.fd)
@@ -772,19 +788,55 @@ class TerminalPane(Widget):
         # What the tool printed belongs to the tool's pane, not to the panel
         # log: dumping its last screen there mixed a frida session into the
         # record of what was run against the device. Only the exit is noted.
+        code = self.proc.poll() if self.proc else None
+        reap(self.proc)
+        self.proc = None
+        self.starting = False
         if self.vt is not None:
+            self.panel.last_terminal_output = self.get_history_text()
+        if self.vt is not None and not was_paused:
             # The one place a tool's exit is reported: both ways out of a tool
             # come through here, and each used to write a line of its own.
             # Only a real exit code is worth naming — one we stopped ourselves
             # comes back as -15 for the SIGTERM, which is noise, not news.
-            code = self.proc.poll() if self.proc else None
             name = escape(self.command)
             self.panel.write(f"[red]{name} exited with {code}" if code and code > 0
                              else f"[dim]{name} exited[/]")
         self.vt = self.stream = None
+        self.border_subtitle = ""
         self.panel.set_class(False, "running")
         if self.panel.is_attached:       # is_attached: see _spawn
             self.panel.focus()
+
+    def get_history_text(self) -> str:
+        """Return the full scrollback history plus current screen lines."""
+        if not self.vt:
+            return ""
+        lines: list[str] = []
+        if hasattr(self.vt, "history") and hasattr(self.vt.history, "top"):
+            cols = self.vt.columns
+            for row in self.vt.history.top:
+                line = "".join(row[x].data for x in range(cols)).rstrip()
+                lines.append(line)
+        for line in self.vt.display:
+            lines.append(line.rstrip())
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    def action_copy_terminal(self) -> None:
+        """Open full terminal history in TextViewerScreen and copy to clipboard."""
+        text = self.get_history_text()
+        if not text:
+            self.app.notify("Terminal buffer is empty", severity="information")
+            return
+        self.app.copy_to_clipboard(text)
+        self.app.notify(f"copied terminal session ({len(text)} chars)")
+        self.app.push_screen(TextViewerScreen(
+            f"Terminal session · {self.command}", text
+        ))
 
     def _readable(self) -> None:
         try:
@@ -792,21 +844,72 @@ class TerminalPane(Widget):
         except OSError:
             data = b""
         if not data:
-            # poll(), not wait(): the pty can report EOF a moment before the
-            # process is gone, and blocking here freezes the whole interface.
-            if self.proc:
-                self.proc.poll()
+            if self.proc and self.proc.poll() is None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self.proc.wait(timeout=0.1)
+            code = self.proc.poll() if self.proc else 0
+            if code is not None and code > 0 and code not in (130, 143):
+                self._pause_on_exit(code)
+                return
             self._teardown()
             return
         assert self.stream
         self.stream.feed(data)
         self.refresh()
 
+    def _pause_on_exit(self, code: int) -> None:
+        """Keep the terminal pane visible when a tool crashes or exits non-zero,
+        so errors and tracebacks can be read rather than disappearing in a flash."""
+        if self.fd is not None:
+            with contextlib.suppress(RuntimeError, ValueError, OSError):
+                asyncio.get_running_loop().remove_reader(self.fd)
+            os.close(self.fd)
+            self.fd = None
+        self.exited = code
+        name = escape(self.command)
+        self.panel.write(f"[red]{name} exited with {code} — pane kept open to inspect error[/]")
+        self.border_subtitle = (
+            f" [bold red]exited with code {code} · enter / esc close · c copy [/] "
+        )
+        self.refresh()
+
     def action_leave(self) -> None:
         """Hand focus back to the panel; the tool keeps running."""
         self.panel.focus()
 
+    action_leave_terminal = action_leave
+
+    def on_click(self, event: events.Click) -> None:
+        if self.running and event.y >= max(0, self.size.height - 1):
+            self.action_copy_terminal()
+            event.stop()
+            event.prevent_default()
+
     def on_key(self, event: events.Key) -> None:
+        if self.exited is not None:
+            if event.key.lower() in ("c", "ctrl+c", "alt+c"):
+                code = self.exited
+                cmd = self.command
+                plain_text = self.get_history_text() or self.render().plain.strip()
+                self._teardown()
+                self.app.copy_to_clipboard(plain_text)
+                self.app.notify(f"copied terminal output ({len(plain_text)} chars)")
+                self.app.push_screen(TextViewerScreen(
+                    f"Terminal error · {cmd} (exit code {code})", plain_text
+                ))
+                event.stop()
+                event.prevent_default()
+                return
+            self._teardown()
+            if event.key.lower() in ("escape", "enter", "space", "q", "f8"):
+                event.stop()
+                event.prevent_default()
+            return
+        if event.key.lower() in ("alt+c", "f2"):
+            self.action_copy_terminal()
+            event.stop()
+            event.prevent_default()
+            return
         # f8 first: this handler stops every key before bindings are looked at,
         # so the way out of the pane has to be let through here or it is eaten
         # along with the rest.
@@ -956,11 +1059,11 @@ class BarKey(Static):
     sidebar, h at the right.
     """
 
-    def __init__(self, key: str, label: str, tooltip: str) -> None:
+    def __init__(self, key: str, label: str, tooltip: str, id: str | None = None) -> None:
         # The footer's own colours, so a pinned key reads as part of the bar
         # rather than as a widget that happens to sit beside it.
         super().__init__(f"[$footer-key-foreground on $footer-key-background]{key}[/]"
-                         f" [$footer-description-foreground]{label}[/]")
+                         f" [$footer-description-foreground]{label}[/]", id=id)
         self.key = key
         self.tooltip = tooltip
 
@@ -1154,31 +1257,103 @@ class FridaArgsScreen(AskScreen):
             self.add(f"--codeshare {slug}")
 
 
-class ConfirmScreen(ModalScreen[bool]):
+class ConfirmScreen(ModalScreen[Any]):
     """A yes/no question. Enter and escape both take the answer that changes
     nothing, so leaning on the keyboard never overwrites anything."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("y", "yes", "yes"),
         Binding("n,escape,enter", "no", "no"),
+        Binding("c,v", "custom", "custom", show=False),
     ]
     CSS = modal_css("ConfirmScreen", 92)
 
-    def __init__(self, question: str, yes: str, no: str) -> None:
+    def __init__(self, question: str, yes: str, no: str,
+                 extra: tuple[str, str] | None = None) -> None:
         super().__init__()
         self.question, self.yes, self.no = question, yes, no
+        self.extra = extra
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
             yield Static(f"[b]{escape(self.question)}[/]\n")
             yield Static(f"[b]y[/]  {escape(self.yes)}")
             yield Static(f"[b]n[/]  {escape(self.no)}   [dim](enter, esc)[/]")
+            if self.extra:
+                k, desc = self.extra
+                yield Static(f"[b]{escape(k)}[/]  {escape(desc)}")
 
     def action_yes(self) -> None:
         self.dismiss(True)
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+    def action_custom(self) -> None:
+        if self.extra:
+            self.dismiss(self.extra[0])
+
+
+class TextViewerScreen(ModalScreen[None]):
+    """Full-screen text viewer for reading, selecting and copying logs."""
+
+    CSS = """
+    TextViewerScreen {
+        align: center middle;
+    }
+    TextViewerScreen > #viewer-box {
+        width: 95%;
+        height: 90%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    TextViewerScreen > #viewer-box > TextArea {
+        height: 1fr;
+        border: solid $panel;
+    }
+    TextViewerScreen > #viewer-box > Static {
+        margin-top: 1;
+    }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape,q,enter", "dismiss_viewer", "close"),
+        Binding("ctrl+c,c", "copy_text", "copy", priority=True),
+        Binding("ctrl+a", "select_all", "select all", priority=True),
+    ]
+
+    def __init__(self, title: str, text: str) -> None:
+        super().__init__()
+        self.title_text = title
+        self.content_text = text
+
+    def compose(self) -> ComposeResult:
+        nlines = len(self.content_text.splitlines())
+        with Vertical(id="viewer-box"):
+            yield Static(f"[b]{escape(self.title_text)}[/]  [dim]({nlines} lines)[/]")
+            yield TextArea(self.content_text, read_only=True, id="viewer-area")
+            yield Static(
+                "[dim]esc / q / enter close · c / ctrl+c copy · ctrl+a select all[/]"
+            )
+
+    def on_mount(self) -> None:
+        with contextlib.suppress(NoMatches):
+            self.query_one("#viewer-area", TextArea).focus()
+
+    def action_dismiss_viewer(self) -> None:
+        self.dismiss(None)
+
+    def action_copy_text(self) -> None:
+        area = self.query_one("#viewer-area", TextArea)
+        selected = area.selected_text
+        text_to_copy = selected if selected else self.content_text
+        self.app.copy_to_clipboard(text_to_copy)
+        self.notify(f"copied {len(text_to_copy)} characters to clipboard")
+
+    def action_select_all(self) -> None:
+        area = self.query_one("#viewer-area", TextArea)
+        area.select_all()
+
 
 
 class FileList(Vertical):
@@ -1295,10 +1470,15 @@ class FileList(Vertical):
             # entries and the ones worth descending into are what you came for.
             names = sorted(listed, key=lambda n: (not n.endswith("/"), n.lower()))
             if rc != 0 or not names:
-                lv.append(ValueItem("", Text(out.strip() or "empty", "red" if rc else "dim")))
-                return
-            for name in names:
-                lv.append(ValueItem(name, Text(name, "bold" if name.endswith("/") else "")))
+                item = ValueItem("", Text(out.strip() or "empty", "red" if rc else "dim"))
+                item.highlighted = True
+                lv.append(item)
+            else:
+                for idx, name in enumerate(names):
+                    item = ValueItem(name, Text(name, "bold" if name.endswith("/") else ""))
+                    if idx == 0:
+                        item.highlighted = True
+                    lv.append(item)
             # A list with no cursor is a list where the next key does nothing:
             # clear() drops the index, and a reload happens after every copy,
             # rename and delete.
@@ -1776,15 +1956,20 @@ class CodeshareScreen(ModalScreen[str | None]):
         )
         lv = self.query_one("#hits", ListView)
         lv.clear()
-        for s in window or [Script("", "nothing here", "", "")]:
+        entries = window or [Script("", "nothing here", "", "")]
+        for idx, s in enumerate(entries):
             # Two lines each, the way the tool check and the help panel read:
             # the slug is what you are choosing, the description is why. All of
             # it assembled as Text, never markup, so a description written by
             # a stranger cannot break the list.
-            lv.append(ValueItem(s.slug, Text.assemble(
+            item = ValueItem(s.slug, Text.assemble(
                 (s.slug or s.title, "bold"), (f"  ♥{s.likes}" if s.likes else ""),
                 ("\n  " + s.about[:150], "dim") if s.about else "",
-            )))
+            ))
+            if idx == 0:
+                item.highlighted = True
+            lv.append(item)
+        lv.index = 0
 
     async def fetch(self) -> list[Script] | None:
         """Scripts for the current query and page, or None if the fetch failed.
@@ -1806,7 +1991,9 @@ class CodeshareScreen(ModalScreen[str | None]):
         if rc != 0:
             lv = self.query_one("#hits", ListView)
             lv.clear()
-            lv.append(ValueItem("", Text(out.strip()[:200] or "fetch failed", "red")))
+            item = ValueItem("", Text(out.strip()[:200] or "fetch failed", "red"))
+            item.highlighted = True
+            lv.append(item)
             where.update(f"[red]codeshare unreachable[/]  [dim]{escape(url)}[/]")
             return None
         scripts, site_pages = parse_codeshare(out)
@@ -1892,6 +2079,8 @@ class DevicePanel(Vertical):
         # A line filter for the log stream, where narrowing it to one process
         # is this side's job rather than the tool's: see IosPanel.log_command.
         self.log_keep = ""
+        self.log_filter: str = ""
+        self.log_history: list[str] = []
         # Streams asked for whose process is not up yet. The spawn is a worker,
         # so without this a second keypress starts a second logcat and the
         # first is left running with nothing holding it — the trap
@@ -2002,6 +2191,11 @@ class DevicePanel(Vertical):
         self.mob.notify(message, title=self.serial, severity="error")
 
     def emit(self, text: Text) -> None:
+        if plain := text.plain:
+            for line in plain.splitlines():
+                self.log_history.append(line)
+            if len(self.log_history) > 10000:
+                del self.log_history[:-10000]
         # is_attached, not is_mounted: see TerminalPane._spawn.
         if not self.is_attached:
             return
@@ -2012,7 +2206,22 @@ class DevicePanel(Vertical):
     def _flush(self, buffer: list[str]) -> None:
         if buffer:
             lines, buffer[:] = list(buffer), []
-            self.emit(Text("\n".join(lines)))
+            if self.log_filter:
+                text = Text()
+                kw = self.log_filter.lower()
+                for i, line in enumerate(lines):
+                    if i > 0:
+                        text.append("\n")
+                    lower_line = line.lower()
+                    pos = 0
+                    while (idx := lower_line.find(kw, pos)) != -1:
+                        text.append(line[pos:idx])
+                        text.append(line[idx:idx + len(kw)], style="bold black on yellow")
+                        pos = idx + len(kw)
+                    text.append(line[pos:])
+                self.emit(text)
+            else:
+                self.emit(Text("\n".join(lines)))
 
     # ------------------------------------------------------------ per family
 
@@ -2051,6 +2260,11 @@ class DevicePanel(Vertical):
         rc, out = await self.copy_in(local, remote)
         if rc != 0 and self.can_stage:
             return await self.push_as_root(local, remote)
+        if rc != 0 and not self.can_stage:
+            parent = remote.rsplit("/", 1)[0]
+            if parent:
+                await self.run(f"mkdir -p {shlex.quote(parent)}")
+                return await self.copy_in(local, remote)
         return rc, out
 
     async def push_as_root(self, local: str, remote: str) -> tuple[int, str]:
@@ -2059,6 +2273,9 @@ class DevicePanel(Vertical):
         rc, out = await self.copy_in(local, staged)
         if rc != 0:
             return rc, out
+        parent = remote.rsplit("/", 1)[0]
+        if parent:
+            await self.run(f"mkdir -p {shlex.quote(parent)}")
         rc, out = await self.run(f"mv {shlex.quote(staged)} {shlex.quote(remote)}")
         if rc != 0:
             # Never leave the staged copy behind: it is the whole file, sitting
@@ -2215,6 +2432,7 @@ class DevicePanel(Vertical):
         mirror = (f"[$success]●[/] {self.mirror.pid}"
                   if self.mirror and self.mirror.poll() is None else "[dim]○[/]")
         logs = "[$success]●[/]" if self.log_stream in self.streams else "[dim]○[/]"
+        filter_badge = f" [cyan]/{escape(self.log_filter)}[/]" if self.log_filter else ""
         batt = f"{level}%" if (level := now.get("batt", "?")) != "?" else "?"
         # Suppressed as one block: the panel can be torn down between the check
         # above and here, and its children go first — so every child lookup in
@@ -2233,7 +2451,7 @@ class DevicePanel(Vertical):
                 # Static.update() has no fallback for markup it cannot parse.
                 f"[dim]ip   [/] {escape(now.get('ip') or '?')}\n"
                 f"[dim]frida[/] {frida}   [dim]{self.mirror_tool}[/] {mirror}"
-                f"   [dim]{self.log_stream}[/] {logs}"
+                f"   [dim]{self.log_stream}[/] {logs}{filter_badge}"
             )
 
     async def shutdown(self) -> None:
@@ -2278,6 +2496,32 @@ class DevicePanel(Vertical):
             self.write("[dim]frida-server stopped")
         await self.refresh_stats()
 
+    async def do_purge(self, verbose: bool = True, log_prefix: str = "removed") -> bool:
+        """Stop frida-server and delete it, so the device keeps nothing of ours."""
+        extra_junk = f"{self.jb}/usr/lib/frida-1.0" if hasattr(self, "jb") else ""
+        detected = getattr(self, "_detected_server_path", None)
+        junk = " ".join(dict.fromkeys(
+            filter(None, (self.server_path, detected, self.server_junk, extra_junk))
+        ))
+        if pid := await self.frida_pid():
+            if verbose:
+                self.write(f"kill    {self.server_path} (pid {pid})")
+            await self.run(self.kill_frida(pid))
+            await asyncio.sleep(0.5)
+        rc, out = await self.run(f"rm -rf {junk}")
+        log_path = (f"{self.staging_dir}/frida-server.log"
+                    if self.staging_dir else f"{self.server_path}.log")
+        await self.run(f"rm -f {shlex.quote(log_path)}")
+        self._detected_server_path = None
+        if rc != 0 and out.strip():
+            if verbose:
+                self.fail(out.strip())
+            return False
+        if verbose:
+            self.write(f"[dim]{log_prefix} {junk}")
+        await self.refresh_stats()
+        return True
+
     async def purge_frida(self) -> None:
         """Stop frida-server and delete it, so the device keeps nothing of ours.
 
@@ -2285,62 +2529,84 @@ class DevicePanel(Vertical):
         would recognise. Putting it back costs one push from the cache, so
         leaving nothing behind is cheap enough to be worth a key of its own.
         """
-        junk = " ".join(filter(None, (self.server_path, self.server_junk)))
+        extra_junk = f"{self.jb}/usr/lib/frida-1.0" if hasattr(self, "jb") else ""
+        detected = getattr(self, "_detected_server_path", None)
+        junk = " ".join(dict.fromkeys(
+            filter(None, (self.server_path, detected, self.server_junk, extra_junk))
+        ))
         if not await self.mob.push_screen_wait(ConfirmScreen(
                 f"take frida-server off {self.serial}",
                 f"stop it and delete {junk}",
                 "leave it on the device")):
             return
-        if pid := await self.frida_pid():
-            self.write(f"kill    {self.server_path} (pid {pid})")
-            await self.run(self.kill_frida(pid))
-            await asyncio.sleep(0.5)
-        rc, out = await self.run(f"rm -rf {junk}")
-        if rc != 0 and out.strip():
-            self.fail(out.strip())
-        else:
-            self.write(f"[dim]removed {junk}")
-        await self.refresh_stats()
+        await self.do_purge(verbose=True, log_prefix="removed")
 
-    async def ensure_frida(self) -> bool:
+    async def ensure_frida(self, custom_ver: str = "") -> bool:
         """Make sure frida-server is running, installing it if needed. Verbose."""
-        if pid := await self.frida_pid():
+        if not custom_ver and (pid := await self.frida_pid()):
             self.write(f"frida-server already running, pid {pid} ({self.server_path})")
             await self.warn_drift()
             return True
         if blocker := await self.frida_blocker():
             self.fail(blocker)
             return False
-        # The server must match the local client version exactly or attach fails.
-        # Searched, not matched whole: sh() folds stderr in, and one deprecation
-        # warning from the frida wheel used to read as "frida is not installed".
-        _, out = await sh("frida", "--version")
-        if not (found := re.search(r"\d+(?:\.\d+)+", out)):
-            self.fail(f"frida did not report a version: {out.strip()[:80] or 'no output'}")
-            return False
-        ver = found.group()
+        ver = custom_ver
+        if not ver:
+            # The server must match the local client version exactly or attach fails.
+            # Searched, not matched whole: sh() folds stderr in, and one deprecation
+            # warning from the frida wheel used to read as "frida is not installed".
+            _, out = await sh("frida", "--version")
+            if not (found := re.search(r"\d+(?:\.\d+)+", out)):
+                self.fail(f"frida did not report a version: {out.strip()[:80] or 'no output'}")
+                return False
+            ver = found.group()
         arch = self.server_arch()
         if arch is None:
             # Guessing here installs a binary the device cannot execute, and the
             # failure shows up later as an unexplained "did not stay up".
             self.fail(f"no frida-server build for {self.kind} cpu {self.cpu!r}")
             return False
-        self.write(f"client  [b]frida {ver}[/] · device [b]{escape(self.cpu)}[/]"
-                   f" -> server [b]{self.frida_platform}-{arch}[/]")
-        # Something is already there: it may be a build someone put on the
-        # device on purpose, or the same version we would push anyway, so
-        # replacing it silently is the one thing not to do.
-        if (there := await self.server_bytes()) is not None:
-            self.write(f"found   [b]{self.server_path}[/] already on the device"
-                       f" ({there // 1024} KiB)")
-            if not await self.mob.push_screen_wait(ConfirmScreen(
-                f"{self.server_path} is already on {self.serial} ({there // 1024} KiB)",
-                f"replace it with the build matching frida {ver} ({arch})",
-                "start the one that is already there",
-            )):
-                return await self.launch_server("the frida-server already on the device")
+        if not custom_ver:
+            self.write(f"client  [b]frida {ver}[/] · device [b]{escape(self.cpu)}[/]"
+                       f" -> server [b]{self.frida_platform}-{arch}[/]")
+            # Something is already there: it may be a build someone put on the
+            # device on purpose, or the same version we would push anyway, so
+            # replacing it silently is the one thing not to do.
+            if (there := await self.server_bytes()) is not None:
+                self.write(f"found   [b]{self.server_path}[/] already on the device"
+                           f" ({there // 1024} KiB)")
+                choice = await self.mob.push_screen_wait(ConfirmScreen(
+                    f"{self.server_path} is already on {self.serial} ({there // 1024} KiB)",
+                    f"replace it with the build matching frida {ver} ({arch})",
+                    "start the one that is already there",
+                    extra=("c", "download and install a specific frida version"),
+                ))
+                if not choice:
+                    return await self.launch_server("the frida-server already on the device")
+            else:
+                choice = await self.mob.push_screen_wait(ConfirmScreen(
+                    f"frida-server is not on {self.serial}",
+                    f"download and install client version frida {ver} ({arch})",
+                    "cancel",
+                    extra=("c", "download and install a specific frida version"),
+                ))
+                if not choice:
+                    return False
+            if choice == "c":
+                chosen = await self.mob.push_screen_wait(AskScreen(
+                    "install specific frida version", "", "e.g. 16.5.9 or 16.2.1"
+                ))
+                if not chosen or not chosen.strip():
+                    return False
+                ver = chosen.strip()
+                self.write(f"custom  [b]frida {ver}[/] · device [b]{escape(self.cpu)}[/]"
+                           f" -> server [b]{self.frida_platform}-{arch}[/]")
+        else:
+            self.write(f"custom  [b]frida {ver}[/] · device [b]{escape(self.cpu)}[/]"
+                       f" -> server [b]{self.frida_platform}-{arch}[/]")
         if (payload := await self.server_files(ver, arch)) is None:
             return False
+        await self.do_purge(verbose=True, log_prefix="purge  ")
         for local, remote in payload:
             self.write(f"push    [b]{local.name}[/] -> [b]{remote}[/]"
                        f"  [dim]({local.stat().st_size // 1024} KiB)[/]")
@@ -2348,6 +2614,8 @@ class DevicePanel(Vertical):
             if rc != 0:
                 self.fail(f"push failed: {out.strip()}")
                 return False
+            await self.run(f"chmod 755 {shlex.quote(remote)}")
+        self._detected_server_path = None
         return await self.launch_server(f"frida-server {ver} ({arch})")
 
     async def warn_drift(self) -> None:
@@ -2423,19 +2691,35 @@ class DevicePanel(Vertical):
 
     async def launch_server(self, what: str) -> bool:
         """chmod and start whatever is at server_path, then confirm it stayed up."""
-        self.write(f"chmod   755 {self.server_path}")
-        await self.run(f"chmod 755 {self.server_path}")
-        self.write(f"exec    nohup {self.server_path} &   [dim](as root)[/]")
+        path = getattr(self, "_detected_server_path", None) or self.server_path
+        log_path = f"{self.staging_dir}/frida-server.log" if self.staging_dir else f"{path}.log"
+        if old_pid := await self.frida_pid():
+            await self.run(self.kill_frida(old_pid))
+            await asyncio.sleep(0.3)
+        self.write(f"chmod   755 {path}")
+        await self.run(f"chmod 755 {shlex.quote(path)}")
+        await self.run(f"rm -f {shlex.quote(log_path)}")
+        self.write(f"exec    nohup {path} &   [dim](as root)[/]")
         # </dev/null as well as the redirected output: over ssh the channel
         # stays open while anything still holds stdin, and the call that
         # started the server would never return.
-        await self.run(f"nohup {self.server_path} >/dev/null 2>&1 </dev/null &")
-        await asyncio.sleep(1)
-        pid = await self.frida_pid()
+        await self.run(f"nohup {path} >{shlex.quote(log_path)} 2>&1 </dev/null &")
+        pid = None
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            if pid := await self.frida_pid():
+                break
         if pid:
             self.write(f"[green]{what} is up, pid {pid}[/]")
         else:
-            self.fail("frida-server did not stay up — check root and the architecture")
+            _, err = await self.run(f"cat {shlex.quote(log_path)} 2>/dev/null")
+            clean_err = " · ".join(ln.strip() for ln in err.strip().splitlines() if ln.strip())
+            if len(clean_err) > 120:
+                clean_err = clean_err[:117] + "…"
+            if clean_err:
+                self.fail(f"frida-server did not stay up: {clean_err}")
+            else:
+                self.fail("frida-server did not stay up — check root and the architecture")
         await self.refresh_stats()
         return pid is not None
 
@@ -2471,7 +2755,9 @@ class DevicePanel(Vertical):
     @work
     async def _stream(self, name: str, cmd: tuple[str, ...], keep: str = "") -> None:
         def wanted(line: str) -> bool:
-            return not keep or keep in line
+            if keep and keep not in line:
+                return False
+            return not (self.log_filter and self.log_filter.lower() not in line.lower())
 
         # A filter that keeps nothing looks exactly like a device with nothing
         # to say, and on the ios syslog it is usually neither: the unified
@@ -2998,7 +3284,7 @@ class IosPanel(DevicePanel):
     @property
     def server_junk(self) -> str:            # type: ignore[override]
         # The agent directory: pushed with the server, and useless without it.
-        return f"{self.jb}/usr/lib/frida-1.0"
+        return f"{self.jb}/usr/lib/frida"
 
     @property
     def cpu(self) -> str:
@@ -3851,9 +4137,28 @@ class IosPanel(DevicePanel):
         offering to start half an installation.
         """
         size = await super().server_bytes()
+        if size is None and self.jb:
+            cmd = "[ -f /usr/sbin/frida-server ] && wc -c < /usr/sbin/frida-server"
+            _, out = await self.run(cmd)
+            if s := next((int(tok) for tok in out.split() if tok.isdigit()), None):
+                size = s
+                self._detected_server_path = "/usr/sbin/frida-server"
+        if size is None and not self.jb:
+            cmd = "[ -f /var/jb/usr/sbin/frida-server ] && wc -c < /var/jb/usr/sbin/frida-server"
+            _, out = await self.run(cmd)
+            if s := next((int(tok) for tok in out.split() if tok.isdigit()), None):
+                size = s
+                self._detected_server_path = "/var/jb/usr/sbin/frida-server"
         if size is None:
             return None
-        rc, _ = await self.run(f"[ -f {self.server_junk}/frida-agent.dylib ]")
+        rc, _ = await self.run(
+            f"[ -f {self.server_junk}/frida-agent.dylib ] || "
+            f"[ -f {self.jb}/usr/lib/frida-1.0/frida-agent.dylib ] || "
+            f"[ -f /var/jb/usr/lib/frida/frida-agent.dylib ] || "
+            f"[ -f /var/jb/usr/lib/frida-1.0/frida-agent.dylib ] || "
+            f"[ -f /usr/lib/frida/frida-agent.dylib ] || "
+            f"[ -f /usr/lib/frida-1.0/frida-agent.dylib ]"
+        )
         return size if rc == 0 else None
 
     async def server_files(self, ver: str, arch: str) -> list[tuple[Path, str]] | None:
@@ -3887,14 +4192,29 @@ class IosPanel(DevicePanel):
             self.write(f"unpack  {len(inside)} files from [b]{deb.name}[/]")
         else:
             self.write(f"cached  [b]{unpacked}[/]")
-        payload = []
-        for path in IOS_FRIDA_FILES:
-            local = unpacked.joinpath(*path.lstrip("/").split("/"))
-            if not local.is_file():
-                self.fail(f"{deb.name} did not contain {path}")
-                return None
-            payload.append((local, f"{self.jb}{path.removeprefix('/var/jb')}"))
-        return payload
+
+        # Find frida-server in unpacked
+        server_local = unpacked / "var/jb/usr/sbin/frida-server"
+        if not server_local.is_file():
+            server_local = next(unpacked.rglob("frida-server"), None)
+        if not server_local or not server_local.is_file():
+            self.fail(f"{deb.name} did not contain frida-server")
+            return None
+
+        # Find frida-agent.dylib in unpacked (handles both frida/ and frida-1.0/)
+        agent_local = next(unpacked.rglob("frida-agent.dylib"), None)
+        if not agent_local or not agent_local.is_file():
+            self.fail(f"{deb.name} did not contain frida-agent.dylib")
+            return None
+
+        # Build remote agent path preserving directory structure
+        # (e.g. usr/lib/frida-1.0/frida-agent.dylib)
+        agent_rel = agent_local.relative_to(unpacked)
+        agent_sub = str(agent_rel).removeprefix("var/jb/").lstrip("/")
+        remote_agent = f"{self.jb}/{agent_sub}"
+        remote_server = f"{self.jb}/usr/sbin/frida-server"
+
+        return [(server_local, remote_server), (agent_local, remote_agent)]
 
     async def dir_holding(self, plists: str) -> str:
         """The directory of the first plist naming the selected package, or "".
@@ -4053,10 +4373,10 @@ class MOABile(App):
     ListView:focus > ListItem.-highlight.-dir Label,
     ListView:focus > ListItem.-selected.-dir Label { color: $background; text-style: bold; }
     #devices > .-active Label, #packages > .-active Label { color: $accent; text-style: bold; }
-    ListView:focus > #devices > .-active.-highlight Label,
-    ListView:focus > #devices > .-active.-selected Label,
-    ListView:focus > #packages > .-active.-highlight Label,
-    ListView:focus > #packages > .-active.-selected Label { color: $background; text-style: bold; }
+    #devices:focus > .-active.-highlight Label,
+    #devices:focus > .-active.-selected Label,
+    #packages:focus > .-active.-highlight Label,
+    #packages:focus > .-active.-selected Label { color: $background; text-style: bold; }
     #panels { width: 1fr; overflow-x: auto; scrollbar-size-horizontal: 1; }
     /* 1fr each, so two devices attached are two panels side by side rather
        than one filling the row. The padding lives on the children: on the
@@ -4111,6 +4431,14 @@ class MOABile(App):
         Binding("l", "log", "log",
                 tooltip="stream logcat or the ios syslog into the panel,"
                         " whole or filtered to the app"),
+        Binding("slash", "filter_logs", "log filter", key_display="/",
+                tooltip="filter log stream by keyword"),
+        Binding("c", "text_viewer", "copy",
+                tooltip="open log history in text viewer to select and copy"),
+        Binding("alt+c", "copy_terminal", "copy terminal", show=False,
+                tooltip="open terminal session history in text viewer to select and copy"),
+        Binding("f8", "leave_terminal", "leave terminal", show=False,
+                tooltip="return keyboard focus from the terminal pane to the panel"),
         Binding("d", "files", "files",
                 tooltip="browse the device and the host side by side, and push or pull files"),
         Binding("a", "install", "add",
@@ -4129,7 +4457,8 @@ class MOABile(App):
         Binding("m", "theme", "mode", tooltip="switch between the dark and the light mode"),
         Binding("h", "keys", "help", show=False,
                 tooltip="show or hide the key and widget help panel"),
-        Binding("q", "quit", "quit", tooltip="stop everything this app started and exit"),
+        Binding("q", "quit", "quit",
+                tooltip="stop everything this app started and exit (q or ctrl+q)"),
     ]
     # A key is the first letter of the word beside it in the bar wherever the
     # letter was free — the bar is where a command is found, and a key standing
@@ -4216,7 +4545,16 @@ class MOABile(App):
         # isinstance: a BINDINGS list is allowed to hold plain tuples, and a
         # tuple has no tooltip to read.
         binding = next(b for b in self.BINDINGS if isinstance(b, Binding) and b.key == key)
-        return BarKey(key, binding.description, binding.tooltip)
+        return BarKey(key, binding.description, binding.tooltip, id=f"barkey-{key}")
+
+    def _update_barkey_visibility(self) -> None:
+        hide = isinstance(self.focused, (Input, TextArea, TerminalPane))
+        for key_id in ("barkey-b", "barkey-h"):
+            with contextlib.suppress(NoMatches):
+                self.query_one(f"#{key_id}", BarKey).display = not hide
+
+    def on_descendant_blur(self, _event: events.DescendantBlur) -> None:
+        self._update_barkey_visibility()
 
     def on_mount(self) -> None:
         # The one place the capitals survive: paths and the command are all
@@ -4320,6 +4658,7 @@ class MOABile(App):
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         """Focus anywhere inside a panel makes it active; the sidebar leaves it alone."""
+        self._update_barkey_visibility()
         node: object = event.widget
         while node is not None:
             if isinstance(node, DevicePanel):
@@ -4799,6 +5138,64 @@ class MOABile(App):
         argv = await panel.log_command(pid or "")
         panel.start_stream(panel.log_stream, *argv, keep=panel.log_keep)
 
+    @work(group="action")
+    async def action_filter_logs(self) -> None:
+        """Filter the active device's log stream by keyword."""
+        if not (panel := self.target()):
+            return
+        filter_kw = await self.push_screen_wait(AskScreen(
+            "filter log stream by keyword",
+            panel.log_filter,
+            "case-insensitive · leave empty to show all lines",
+        ))
+        if filter_kw is None:
+            return
+        panel.log_filter = filter_kw.strip()
+        if panel.log_filter:
+            panel.write(
+                f"[bold cyan]log filter:[/] showing lines matching [b]{escape(panel.log_filter)}[/]"
+            )
+        else:
+            panel.write("[dim]log filter cleared: showing all lines[/]")
+        await panel.refresh_stats()
+
+    @work(group="action")
+    async def action_text_viewer(self) -> None:
+        """Open the active panel's log history in a selectable text viewer modal."""
+        if not (panel := self.target()):
+            return
+        history = panel.log_history
+        content = "\n".join(history) if history else ""
+        with contextlib.suppress(NoMatches):
+            tp = panel.query_one(TerminalPane)
+            if tp.running and tp.vt:
+                term_txt = tp.get_history_text()
+                if term_txt:
+                    header = f"--- Terminal Session ({tp.command}) ---"
+                    sep = f"\n\n{header}\n" if content else f"{header}\n"
+                    content = f"{content}{sep}{term_txt}"
+        if not content and getattr(panel, "last_terminal_output", None):
+            header = "--- Last Terminal Session ---"
+            content = f"{header}\n{panel.last_terminal_output}"
+        if not content:
+            content = "No log or terminal entries recorded yet."
+        title = f"Log viewer · {panel.serial}"
+        await self.push_screen_wait(TextViewerScreen(title, content))
+
+    def action_copy_terminal(self) -> None:
+        """Open terminal session history in text viewer to select and copy."""
+        if isinstance(self.focused, TerminalPane):
+            self.focused.action_copy_terminal()
+        elif (panel := self.target()):
+            pane = panel.query(TerminalPane).first()
+            if pane:
+                pane.action_copy_terminal()
+
+    def action_leave_terminal(self) -> None:
+        """Return keyboard focus from the terminal pane to the panel."""
+        if isinstance(self.focused, TerminalPane):
+            self.focused.action_leave()
+
     def action_files(self) -> None:
         """Browse the device and push or pull files."""
         if panel := self.target():
@@ -4858,10 +5255,33 @@ class MOABile(App):
         if panel := self.target():
             await panel.set_login()
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy text to clipboard via OSC 52, pbcopy (macOS), or Linux clipboard tools."""
+        super().copy_to_clipboard(text)
+        if sys.platform == "darwin":
+            with contextlib.suppress(Exception):
+                proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                proc.communicate(input=text.encode("utf-8"))
+        elif shutil.which("wl-copy"):
+            with contextlib.suppress(Exception):
+                proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+                proc.communicate(input=text.encode("utf-8"))
+        elif shutil.which("xclip"):
+            with contextlib.suppress(Exception):
+                cmd = ["xclip", "-selection", "clipboard"]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                proc.communicate(input=text.encode("utf-8"))
+        elif shutil.which("xsel"):
+            with contextlib.suppress(Exception):
+                cmd = ["xsel", "--clipboard", "--input"]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                proc.communicate(input=text.encode("utf-8"))
+
     def action_clean(self) -> None:
         """Empty the active panel's log."""
         if panel := self.target():
             panel.query_one(f"#log-{panel.uid}", RichLog).clear()
+            panel.log_history.clear()
 
     # ----------------------------------------------------------- this interface
 
@@ -4879,6 +5299,15 @@ class MOABile(App):
             self.action_hide_help_panel()
         else:
             self.action_show_help_panel()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if isinstance(self.focused, (Input, TextArea)):
+            return False
+        if isinstance(self.focused, TerminalPane):
+            if getattr(self.focused, "exited", None) is not None:
+                return action in ("text_viewer", "copy_terminal", "leave_terminal")
+            return action in ("copy_terminal", "leave_terminal")
+        return super().check_action(action, parameters)
 
     @work(group="quit")
     async def action_quit(self) -> None:  # type: ignore[override]
