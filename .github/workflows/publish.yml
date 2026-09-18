@@ -12,7 +12,7 @@ jobs:
     name: Upload release to PyPI
     runs-on: ubuntu-latest
     permissions:
-      id-token: write  # Obbligatorio per Trusted Publishing (OIDC)
+      id-token: write  # Required for Trusted Publishing (OIDC)
     environment:
       name: pypi
       url: https://pypi.org/p/moabile

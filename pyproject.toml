@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moabile"
-version = "1.1.1"
+version = "1.2.0"
 description = "Mother of All Mobile — TUI for Android and iOS mobile app security assessment"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,14 +13,22 @@ authors = [
     {name = "Francesco Berti", email = "berti.francesco@proton.me"}
 ]
 keywords = [
-    "frida",
+    "adb",
     "android",
+    "frida",
     "ios",
+    "ioscpy",
+    "iproxy",
+    "jailbreak",
     "mobile-security",
+    "objection",
+    "penetration-testing",
     "pentesting",
-    "tui",
+    "root",
+    "scrcpy",
     "terminal",
-    "textual"
+    "textual",
+    "tui",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

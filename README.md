@@ -5,7 +5,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20iOS-brightgreen.svg)](#)
 [![Tested on: Kali Linux](https://img.shields.io/badge/tested%20on-Kali%20Linux-557C94.svg?logo=kalilinux&logoColor=white)](#)
-[![Coverage](https://img.shields.io/badge/coverage-97%25-success.svg)](#)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#)
 
 A multi-device terminal UI for mobile app testing.
 Android over `adb`, jailbroken iOS over usbmux and ssh, both at the same time,
@@ -26,8 +26,10 @@ machine never needs libimobiledevice installed to get past it.
 
 An iPhone is reached with libimobiledevice for everything that needs no
 cooperation from the phone (device info, syslog, installing an ipa) and with ssh
-down an `iproxy` tunnel for a shell, the filesystem and frida-server. The ssh
-password is asked for once and kept in memory. No key is ever installed on the
+down an `iproxy` tunnel for a shell, the filesystem and frida-server. For SSH
+features on jailbroken iOS, the phone must have `OpenSSH` installed (available in
+standard repositories via Sileo, Zebra, or Cydia) with `sshd` listening on port 22.
+The ssh password is asked for once and kept in memory. No key is ever installed on the
 phone: that would be a file of ours left behind on someone else's device.
 
 Nothing is assumed to be installed on the phone either. Jailbreaks ship
@@ -42,9 +44,27 @@ so `grep` and `open` are not reported missing on a phone that has them.
 
 ## Installation & Run
 
-### Recommended: `pipx` (Isolated CLI)
+### Recommended: `uv` (Fastest & Isolated CLI)
 
-The easiest and cleanest way to run MOABile without dependency conflicts or `externally-managed-environment` errors:
+Run directly on the fly without permanent installation:
+
+```bash
+uvx moabile
+```
+
+Or install globally in an isolated environment:
+
+```bash
+uv tool install moabile
+
+# Run
+moabile
+
+# Upgrade
+uv tool upgrade moabile
+```
+
+### Alternative: `pipx` (Isolated CLI)
 
 ```bash
 # Install globally in an isolated environment
@@ -52,18 +72,24 @@ pipx install moabile
 
 # Run
 moabile
-```
 
-Or run it directly on the fly without permanent installation:
-
-```bash
+# Or run directly on the fly without permanent installation:
 pipx run moabile
+
+# Upgrade
+pipx upgrade moabile
 ```
 
-### Via `pip`
+### Via `pip` (or `uv pip`)
 
 ```bash
+# With uv
+uv pip install moabile
+
+# With pip
 pip install moabile
+
+# Run
 moabile
 ```
 
@@ -72,13 +98,12 @@ moabile
 Clone the repository and install requirements:
 
 ```bash
-pip install -r requirements.txt
+# With uv (fast & isolated)
+uv venv
+uv pip install -r requirements.txt
 python3 moabile.py
-```
 
-On distributions that manage their own Python (`error: externally-managed-environment`), use a virtualenv:
-
-```bash
+# Or with python venv & pip
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 python3 moabile.py
@@ -122,16 +147,24 @@ gate does not let you through — there would be nothing past it to do.
 |---|---|---|---|
 | `r` | **r**escan for devices | `i` | device **i**nfo dump |
 | `b` | the side**b**ar, on and off | `u` | ssh **u**ser for this device |
-| `f` | **f**rida-server, on and off | `p` | **p**urge frida-server off the device |
+| `f` | **f**rida-server, on and off | `p` | **p**urge frida (device & client venvs) |
 | `s` | **s**pawn the app under frida, or attach | `k` | clear this panel's log |
 | `o` | explore the app with **o**bjection | `/` | filter log stream by keyword |
 | `w` | mirror the screen in a **w**indow | `c` | **c**opy log / text viewer modal |
 | `t` | **t**erminal on the device | `v` | save an s**v**g of the interface |
 | `l` | stream the device **l**og | `m` | dark/light **m**ode |
 | `d` | files: browse host ↔ device | `h` | **h**elp: keys and widgets |
-| `a` | **a**dd an app: install an apk or ipa | `alt+c` | **c**opy terminal session / viewer |
-| `e` | **e**xport the app's apk/ipa | `f8` | return focus from tool pane |
-| `q`, `ctrl+q` | **q**uit | | |
+| `a` | **a**dd an app: install an apk or ipa | `x` | wipe app data (without uninstall) |
+| `e` | **e**xport the app's apk/ipa | `alt+c` | **c**opy terminal session / viewer |
+| `q`, `ctrl+q` | **q**uit | `f8` | return focus from tool pane |
+
+`x` clears the selected app's user data, cache, and preferences without uninstalling it (`pm clear`
+on Android; on iOS it wipes the application data container, associated App Groups, and resets
+`NSUserDefaults` by purging `cfprefsd`, recreating clean directories with proper ownership).
+
+`w` mirrors the screen in an external window (`scrcpy` on Android, `ioscpy` on iOS). On iOS,
+screen mirroring requires the `ioscpy` server tweak (`com.ioscpy.device`) from
+`https://lautarovculic.github.io/ioscpy-repo/` installed on the device.
 
 `s` spawns the app under frida, which is what a script that has to be in
 place before the app starts needs. Where the app is already running it offers
@@ -140,6 +173,16 @@ on the running process sees what the device log does not carry: the unified
 log's debug and info entries never reach `idevicesyslog`. Enter and escape keep
 the spawn. `f` toggles frida-server, offering to match the host client, keep
 what is installed, or install a specific custom version.
+
+MOABile supports multiple concurrent Frida client versions: each panel tracks its
+own target Frida version and automatically manages matching client virtual environments
+using `uv` (or `venv`) under `~/.cache/moabile/clients/`. This allows using Frida 17 on Android
+and Frida 16 on iOS within the same session. `p` purges frida-server and can wipe all cached
+client environments.
+
+On Android, MOABile automatically detects Google Play system updates to `com.google.android.art`
+that break Frida (issue [frida/frida#3639](https://github.com/frida/frida/issues/3639)), alerting
+the user and offering to uninstall the update and reboot.
 
 An app that is off screen is suspended on iOS, and attaching to a suspended
 process is a prompt that never arrives — so `s` and `o` bring the app to the
@@ -192,10 +235,17 @@ It prints a `PASS` line per check and `all good` at the end. Run it as a script,
 not under pytest: the module executes the suite on import. One copy at a time —
 it opens real local ports for the usb tunnel, so two runs at once collide.
 
-Lint:
+Coverage (100% statement coverage):
+
+```bash
+python3 -m coverage run --source=moabile test_moabile.py && python3 -m coverage report -m
+```
+
+Lint & Type Check:
 
 ```bash
 ruff check .
+mypy moabile.py test_moabile.py
 ```
 
 ## Scope

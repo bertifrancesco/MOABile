@@ -43,6 +43,7 @@ import sys
 import tarfile
 import tempfile
 import termios
+from collections.abc import Callable
 from html import unescape
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple
@@ -76,7 +77,7 @@ from textual.widgets import (
     TextArea,
 )
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 # What --help says. There are no options to document: everything this does is
 # chosen inside, with the keys. Printed rather than built with argparse, which
 # would be a dependency's worth of machinery for a program that takes nothing.
@@ -196,12 +197,13 @@ SSH_PASSWORD_OPTS = ("-o", "PubkeyAuthentication=no",
 # frida-server is ~15 MB per version and architecture, and /tmp is emptied on
 # reboot, so it is kept where a cache belongs and survives.
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "moabile"
+CLIENTS_CACHE = CACHE / "clients"
 CODESHARE = "https://codeshare.frida.re"
 # Where every frida-server build comes from, whichever family asks for one.
 FRIDA_RELEASES = "https://github.com/frida/frida/releases/download"
 # Hits per page in the codeshare browser: two lines each, so this is what its
 # list shows without scrolling.
-CODESHARE_PAGE = 10
+CODESHARE_PAGE = 12
 # Rows the app list draws at most. Every row is a widget mount: a hundred cost
 # a fifth of a second and five hundred the best part of one, and that is paid
 # again on every pause in the filter — so a phone carrying a couple of hundred
@@ -366,6 +368,20 @@ DEPS = [
 FAMILIES = ("android", "ios")
 
 
+def safe_killpg(pid: Any, sig: int) -> None:
+    """Send a signal to the process group of pid, guarding against invalid PIDs
+    and never signaling our own process group.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        pgid = os.getpgid(pid)
+        if pgid <= 1 or pgid == os.getpgrp() or pgid == os.getpid():
+            os.kill(pid, sig)
+            return
+        os.killpg(pgid, sig)
+
+
 async def _nothing() -> tuple[int, str]:
     """Stand in for a command a missing toolchain means there is no point running."""
     return 0, ""
@@ -397,8 +413,7 @@ async def sh(*cmd: str, timeout: float = 15, feed: bytes = b"") -> tuple[int, st
         out, _ = await asyncio.wait_for(proc.communicate(feed or None), timeout)
     except (asyncio.TimeoutError, TimeoutError):
         # The whole group: `sh -c "curl | xz -d"` leaves curl running otherwise.
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        safe_killpg(getattr(proc, "pid", None), signal.SIGKILL)
         await proc.wait()
         return 124, f"{' '.join(cmd)}: timed out after {timeout:g}s"
     return proc.returncode or 0, out.decode(errors="replace")
@@ -419,6 +434,106 @@ async def help_has(tool: str, needle: str) -> bool:
         _, out = await sh(tool, "--help", timeout=5)
         _HELP[key] = needle in out
     return _HELP[key]
+
+
+def client_venv_dir(ver: str) -> Path:
+    return CLIENTS_CACHE / f"frida-{ver}"
+
+
+def client_frida_bin(ver: str) -> Path:
+    return client_venv_dir(ver) / "bin" / "frida"
+
+
+def client_objection_bin(ver: str) -> Path:
+    return client_venv_dir(ver) / "bin" / "objection"
+
+
+def purge_client_venv(ver: str) -> bool:
+    vdir = client_venv_dir(ver)
+    existed = vdir.exists()
+    shutil.rmtree(vdir, ignore_errors=True)
+    return existed
+
+
+def purge_all_client_venvs() -> int:
+    dirs = [d for d in CLIENTS_CACHE.iterdir() if d.is_dir()] if CLIENTS_CACHE.exists() else []
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    return len(dirs)
+
+
+async def ensure_client_venv(ver: str, log_fn: Callable[[str], None] | None = None) -> Path | None:
+    """Ensure a virtualenv with frida==ver (and frida-tools, objection) exists.
+
+    Uses uv if available on PATH, otherwise falls back to standard python3 -m venv.
+    """
+    vdir = client_venv_dir(ver)
+    frida_bin = client_frida_bin(ver)
+    if frida_bin.exists():
+        return frida_bin
+
+    if log_fn:
+        log_fn(f"client  [cyan]setting up client environment for frida {ver}...[/]")
+    try:
+        vdir.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if log_fn:
+            log_fn(f"[red]cannot create cache dir {vdir.parent}: {exc}")
+        return None
+
+    has_uv = shutil.which("uv") is not None
+    if has_uv:
+        rc, out = await sh("uv", "venv", str(vdir), timeout=60)
+        pip_base = ["uv", "pip", "install", "--python", str(vdir / "bin" / "python")]
+    else:
+        rc, out = await sh(sys.executable, "-m", "venv", str(vdir), timeout=60)
+        pip_base = [str(vdir / "bin" / "pip"), "install"]
+
+    if rc != 0:
+        if log_fn:
+            prefix = "uv venv" if has_uv else "venv creation"
+            log_fn(f"[red]{prefix} failed: {out.strip()}")
+        return None
+
+    async def run_pip(pkgs: list[str]) -> tuple[int, str]:
+        return await sh(*pip_base, *pkgs, timeout=300)
+
+    # Build progressive candidates generically without hardcoding any version:
+    # 1. Exact version with frida-tools and objection
+    # 2. Exact version with frida-tools only (in case objection has conflicts)
+    # 3. Compatible patch release in same minor series (e.g. if frida-tools requires >=17.0.1)
+    # 4. Compatible release in same major series
+    parts = ver.split(".")
+    major = parts[0]
+    minor = parts[1] if len(parts) > 1 else "0"
+
+    candidates: list[list[str]] = [
+        [f"frida=={ver}", "frida-tools", "objection"],
+        [f"frida=={ver}", "frida-tools"],
+    ]
+    if major.isdigit() and minor.isdigit():
+        candidates.append([f"frida>={ver},<{major}.{int(minor)+1}.0", "frida-tools"])
+        candidates.append([f"frida>={ver},<{int(major)+1}.0.0", "frida-tools"])
+
+    last_err = ""
+    installed = False
+    for pkgs in candidates:
+        rc, out = await run_pip(pkgs)
+        if rc == 0:
+            installed = True
+            if "objection" not in pkgs:
+                await run_pip(["objection"])
+            break
+        last_err = out.strip()
+
+    if not installed or not frida_bin.exists():
+        if log_fn:
+            log_fn(f"[red]failed to install frida {ver} client: {last_err}")
+        return None
+
+    if log_fn:
+        log_fn(f"client  [green]frida {ver} client ready in {vdir.name}[/]")
+    return frida_bin
 
 
 def port_free(port: int) -> bool:
@@ -772,8 +887,7 @@ class TerminalPane(Widget):
         if self.running and self.proc:
             reap(self.proc)
             if self.proc.poll() is None:      # ignored the terminate: insist
-                with contextlib.suppress(ProcessLookupError, OSError):
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                safe_killpg(getattr(self.proc, "pid", None), signal.SIGKILL)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     self.proc.wait(timeout=2)
         self._teardown()
@@ -939,8 +1053,7 @@ class TerminalPane(Widget):
                 return                       # pyte's resize() clears the screen
             self.vt.resize(rows, cols)
             _set_winsize(self.fd, rows, cols)
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGWINCH)  # type: ignore[union-attr]
+            safe_killpg(getattr(self.proc, "pid", None), signal.SIGWINCH)
 
     def render(self) -> Text:
         if not self.vt:
@@ -994,9 +1107,10 @@ def reap(proc: subprocess.Popen | None) -> None:
     """
     if not proc or proc.poll() is not None:
         return
-    with contextlib.suppress(ProcessLookupError, OSError):
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    with contextlib.suppress(subprocess.TimeoutExpired):
+    safe_killpg(getattr(proc, "pid", None), signal.SIGTERM)
+    with contextlib.suppress(
+        subprocess.TimeoutExpired, ProcessLookupError, OSError, AttributeError
+    ):
         proc.wait(timeout=2)
 
 
@@ -1293,6 +1407,12 @@ class ConfirmScreen(ModalScreen[Any]):
     def action_custom(self) -> None:
         if self.extra:
             self.dismiss(self.extra[0])
+
+    def on_key(self, event: events.Key) -> None:
+        if self.extra and event.key == self.extra[0]:
+            self.dismiss(self.extra[0])
+            event.prevent_default()
+            event.stop()
 
 
 class TextViewerScreen(ModalScreen[None]):
@@ -1932,8 +2052,11 @@ class CodeshareScreen(ModalScreen[str | None]):
         Binding("left,ctrl+b", "prev", "back a page"),
         Binding("r,ctrl+r", "reload", "reload"),
     ]
-    CSS = modal_css("CodeshareScreen", 110, 34) + """
-    CodeshareScreen ListView { height: 1fr; max-height: 100%; }
+    CSS = modal_css("CodeshareScreen", 110, 33) + """
+    CodeshareScreen ListView {
+        height: 1fr; max-height: 100%; scrollbar-size: 0 0; overflow-y: hidden;
+    }
+    CodeshareScreen #box { height: 33; max-height: 33; }
     """
 
     def __init__(self, needle: str = "") -> None:
@@ -1943,6 +2066,9 @@ class CodeshareScreen(ModalScreen[str | None]):
         self.pages = 1
         self.found: list[Script] = []
         self.found_for: str | None = None
+        self.browse_scripts: list[Script] = []
+        self.browse_server_page = 0
+        self.site_pages = 1
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
@@ -1959,6 +2085,8 @@ class CodeshareScreen(ModalScreen[str | None]):
     @on(Input.Submitted, "#needle")
     def search(self, event: Input.Submitted) -> None:
         self.needle, self.page = event.value.strip(), 1
+        self.browse_scripts = []
+        self.browse_server_page = 0
         self.query_one("#hits", ListView).focus()
         self.load()
 
@@ -1970,8 +2098,13 @@ class CodeshareScreen(ModalScreen[str | None]):
             # Ceiling division without importing math for one line.
             self.pages = max(1, -(-len(scripts) // CODESHARE_PAGE))
             self.page = min(self.page, self.pages)
-        window = (scripts[(self.page - 1) * CODESHARE_PAGE:self.page * CODESHARE_PAGE]
-                  if self.needle else scripts)
+            window = scripts[(self.page - 1) * CODESHARE_PAGE:self.page * CODESHARE_PAGE]
+        else:
+            self.pages = self.site_pages
+            p_start, p_end = (self.page - 1) * CODESHARE_PAGE, self.page * CODESHARE_PAGE
+            window = self.browse_scripts[p_start:p_end]
+            if not window and self.browse_scripts:
+                window = self.browse_scripts[-CODESHARE_PAGE:]
         self.query_one("#where", Static).update(
             f"[b]{escape(self.label())}[/]  ·  page {self.page}/{self.pages}"
             f"  ·  {len(scripts)} scripts"
@@ -1980,13 +2113,10 @@ class CodeshareScreen(ModalScreen[str | None]):
         lv.clear()
         entries = window or [Script("", "nothing here", "", "")]
         for idx, s in enumerate(entries):
-            # Two lines each, the way the tool check and the help panel read:
-            # the slug is what you are choosing, the description is why. All of
-            # it assembled as Text, never markup, so a description written by
-            # a stranger cannot break the list.
+            about_line = s.about.splitlines()[0][:95] if s.about else ""
             item = ValueItem(s.slug, Text.assemble(
                 (s.slug or s.title, "bold"), (f"  ♥{s.likes}" if s.likes else ""),
-                ("\n  " + s.about[:150], "dim") if s.about else "",
+                ("\n  " + about_line, "dim") if about_line else "",
             ))
             if idx == 0:
                 item.highlighted = True
@@ -2005,24 +2135,40 @@ class CodeshareScreen(ModalScreen[str | None]):
             return self.found
         where = self.query_one("#where", Static)
         where.update(f"[dim]fetching {escape(self.label())}…[/]")
-        url = (f"{CODESHARE}/search/?query={quote(self.needle)}" if self.needle
-               else f"{CODESHARE}/browse?page={self.page}")
-        # curl, not urllib: it is already a dependency, it honours the proxy
-        # environment, and sh() gives it a deadline and kills it on timeout.
-        rc, out = await sh("curl", "-fsSL", url, timeout=30)
-        if rc != 0:
-            lv = self.query_one("#hits", ListView)
-            lv.clear()
-            item = ValueItem("", Text(out.strip()[:200] or "fetch failed", "red"))
-            item.highlighted = True
-            lv.append(item)
-            where.update(f"[red]codeshare unreachable[/]  [dim]{escape(url)}[/]")
-            return None
-        scripts, site_pages = parse_codeshare(out)
-        self.found, self.found_for = scripts, self.needle or None
-        if not self.needle:
-            self.pages = site_pages
-        return scripts
+        if self.needle:
+            url = f"{CODESHARE}/search/?query={quote(self.needle)}"
+            rc, out = await sh("curl", "-fsSL", url, timeout=30)
+            if rc != 0:
+                lv = self.query_one("#hits", ListView)
+                lv.clear()
+                item = ValueItem("", Text(out.strip()[:200] or "fetch failed", "red"))
+                item.highlighted = True
+                lv.append(item)
+                where.update(f"[red]codeshare unreachable[/]  [dim]{escape(url)}[/]")
+                return None
+            scripts, site_pages = parse_codeshare(out)
+            self.found, self.found_for = scripts, self.needle
+            return scripts
+
+        needed_server_page = self.page
+        if (self.browse_server_page < needed_server_page
+                and self.browse_server_page < self.site_pages):
+            url = f"{CODESHARE}/browse?page={needed_server_page}"
+            rc, out = await sh("curl", "-fsSL", url, timeout=30)
+            if rc != 0:
+                lv = self.query_one("#hits", ListView)
+                lv.clear()
+                item = ValueItem("", Text(out.strip()[:200] or "fetch failed", "red"))
+                item.highlighted = True
+                lv.append(item)
+                where.update(f"[red]codeshare unreachable[/]  [dim]{escape(url)}[/]")
+                return None
+            scripts, site_pages = parse_codeshare(out)
+            self.browse_scripts.extend(scripts)
+            self.browse_server_page = needed_server_page
+            self.site_pages = max(site_pages, self.site_pages)
+        self.found = self.browse_scripts
+        return self.browse_scripts
 
     def label(self) -> str:
         return f"search {self.needle}" if self.needle else "browse"
@@ -2044,6 +2190,8 @@ class CodeshareScreen(ModalScreen[str | None]):
 
     def action_reload(self) -> None:
         self.found_for = None            # force the download again
+        self.browse_scripts = []
+        self.browse_server_page = 0
         self.load()
 
     def action_close(self) -> None:
@@ -2097,12 +2245,16 @@ class DevicePanel(Vertical):
         self.packages: list[str] = []
         self.root = False
         self.mirror: subprocess.Popen | None = None
+        self._mirror_log: Any = None
         self.streams: dict[str, asyncio.subprocess.Process] = {}
         # A line filter for the log stream, where narrowing it to one process
         # is this side's job rather than the tool's: see IosPanel.log_command.
         self.log_keep = ""
         self.log_filter: str = ""
         self.log_history: list[str] = []
+        self.last_terminal_output: str | None = None
+        self._detected_server_path: str | None = None
+        self.frida_version: str | None = None
         # Streams asked for whose process is not up yet. The spawn is a worker,
         # so without this a second keypress starts a second logcat and the
         # first is left running with nothing holding it — the trap
@@ -2372,6 +2524,10 @@ class DevicePanel(Vertical):
         """The mirroring window for this device, as the index-th one open."""
         raise NotImplementedError
 
+    async def mirror_ready(self) -> tuple[bool, str]:
+        """Whether the device meets prerequisites to start screen mirroring."""
+        return True, ""
+
     async def log_command(self, pid: str) -> list[str]:
         """The device log: the whole device, or narrowed to one pid.
 
@@ -2433,6 +2589,42 @@ class DevicePanel(Vertical):
         """Why frida-server cannot run on this device, or None when it can."""
         return None
 
+    async def check_art_module(self) -> bool:
+        """Check for Google Play ART update (com.google.android.art), which breaks frida."""
+        return True
+
+    async def clear_app_data(self) -> bool:
+        """Clear all data for the selected app without uninstalling it."""
+        raise NotImplementedError
+
+    async def get_frida_cmd(self) -> str:
+        """Resolve the frida client executable to run for this panel."""
+        if not self.frida_version:
+            return "frida"
+        _, out = await sh("frida", "--version")
+        if (m := re.search(r"\d+(?:\.\d+)+", out)) and m.group() == self.frida_version:
+            return "frida"
+        bin_path = await ensure_client_venv(self.frida_version, self.write)
+        if bin_path and bin_path.exists():
+            return str(bin_path)
+        return "frida"
+
+    async def get_objection_cmd(self) -> str:
+        """Resolve the objection client executable to run for this panel."""
+        if not self.frida_version:
+            return "objection"
+        bin_path = client_objection_bin(self.frida_version)
+        if bin_path.exists():
+            return str(bin_path)
+        _, out = await sh("frida", "--version")
+        if ((m := re.search(r"\d+(?:\.\d+)+", out)) and m.group() == self.frida_version
+                and shutil.which("objection")):
+            return "objection"
+        bin_installed = await ensure_client_venv(self.frida_version, self.write)
+        if bin_installed and bin_path.exists():
+            return str(bin_path)
+        return "objection"
+
     # -------------------------------------------------------------- lifecycle
 
     async def load(self) -> None:
@@ -2481,6 +2673,11 @@ class DevicePanel(Vertical):
         with contextlib.suppress(NoMatches):     # already partly torn down
             self.term.stop()
         reap(self.mirror)
+        self.mirror = None
+        if getattr(self, "_mirror_log", None):
+            with contextlib.suppress(Exception):
+                self._mirror_log.close()
+            self._mirror_log = None
         for name in list(self.streams):
             self.stop_stream(name)          # the same whole-group kill as a toggle
 
@@ -2556,15 +2753,23 @@ class DevicePanel(Vertical):
         leaving nothing behind is cheap enough to be worth a key of its own.
         """
         junk = self.junk_files()
-        if not await self.mob.push_screen_wait(ConfirmScreen(
-                f"take frida-server off {self.serial}",
-                f"stop it and delete {junk}",
-                "leave it on the device")):
+        choice = await self.mob.push_screen_wait(ConfirmScreen(
+            f"take frida-server off {self.serial}",
+            f"stop it and delete {junk}",
+            "leave it on the device",
+            extra=("a", "purge device frida AND all local client environments"),
+        ))
+        if not choice:
             return
         await self.do_purge(verbose=True, log_prefix="removed")
+        if choice == "a":
+            cleaned = purge_all_client_venvs()
+            self.write(f"[dim]removed {cleaned} local frida client environment(s)")
 
     async def ensure_frida(self, custom_ver: str = "") -> bool:
         """Make sure frida-server is running, installing it if needed. Verbose."""
+        if not await self.check_art_module():
+            return False
         if not custom_ver and (pid := await self.frida_pid()):
             self.write(f"frida-server already running, pid {pid} ({self.server_path})")
             await self.warn_drift()
@@ -2616,11 +2821,12 @@ class DevicePanel(Vertical):
                     return False
             if choice == "c":
                 chosen = await self.mob.push_screen_wait(AskScreen(
-                    "install specific frida version", "", "e.g. 16.5.9 or 16.2.1"
+                    "install specific frida version", "", "e.g. 16.7.19 or 15.2.2"
                 ))
                 if not chosen or not chosen.strip():
                     return False
                 ver = chosen.strip()
+                self.frida_version = ver
                 self.write(f"custom  [b]frida {ver}[/] · device [b]{escape(self.cpu)}[/]"
                            f" -> server [b]{self.frida_platform}-{arch}[/]")
         else:
@@ -2628,6 +2834,7 @@ class DevicePanel(Vertical):
                        f" -> server [b]{self.frida_platform}-{arch}[/]")
         if (payload := await self.server_files(ver, arch)) is None:
             return False
+        self.frida_version = ver
         await self.do_purge(verbose=True, log_prefix="purge  ")
         for local, remote in payload:
             self.write(f"push    [b]{local.name}[/] -> [b]{remote}[/]"
@@ -2653,9 +2860,17 @@ class DevicePanel(Vertical):
         here = re.search(r"\d+(?:\.\d+)+", out)
         _, out = await self.run(f"{self.server_path} --version")
         there = re.search(r"\d+(?:\.\d+)+", out)
+        if there:
+            self.frida_version = there.group()
         if here and there and here.group() != there.group():
-            self.fail(f"frida-server {there.group()} on the device, frida {here.group()} here"
-                      " — they have to match: p removes it, then f installs the right one")
+            ver = there.group()
+            vbin = client_frida_bin(ver)
+            if vbin.exists():
+                self.write(f"[dim]frida-server {ver} on the device"
+                           f" — using isolated client {ver} (system is {here.group()})[/]")
+            else:
+                self.write(f"[yellow]frida-server {ver} on the device"
+                           f" (system is {here.group()}) — isolated client {ver} will be used[/]")
 
     async def server_files(self, ver: str, arch: str) -> list[tuple[Path, str]] | None:
         """(local file, where it goes on the device) for everything frida needs."""
@@ -2676,14 +2891,14 @@ class DevicePanel(Vertical):
         except OSError:
             return
         for stale in CACHE.iterdir():
-            if f"-{ver}-" in stale.name or f"_{ver}_" in stale.name:
+            if stale.name == "clients" or f"-{ver}-" in stale.name or f"_{ver}_" in stale.name:
                 continue
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
             else:
                 stale.unlink(missing_ok=True)
 
-    async def download(self, url: str, into: Path, pipe: str = "") -> bool:
+    async def download(self, url: str, into: Path, pipe: str = "", quiet: bool = False) -> bool:
         """Fetch url into a file, optionally through a decompressor.
 
         Anything short is a cut connection or an error page, never a build:
@@ -2699,7 +2914,8 @@ class DevicePanel(Vertical):
         if rc != 0 or not into.exists() or into.stat().st_size < MIN_SERVER_BYTES:
             size = into.stat().st_size if into.exists() else 0
             into.unlink(missing_ok=True)
-            self.fail(f"download failed ({size} bytes): {out.strip()[:200]}")
+            if not quiet:
+                self.fail(f"download failed ({size} bytes): {out.strip()[:200]}")
             return False
         self.write(f"fetched {into.stat().st_size // 1024} KiB")
         return True
@@ -2755,8 +2971,7 @@ class DevicePanel(Vertical):
             # The whole group: killing adb alone leaves whatever it spawned
             # holding the pipe open, so the reader never sees EOF and the
             # stream never reports that it ended.
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            safe_killpg(getattr(proc, "pid", None), signal.SIGKILL)
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             return True
@@ -2933,8 +3148,7 @@ class AndroidPanel(DevicePanel):
                 try:
                     _, err = await asyncio.wait_for(proc.communicate(), 600)
                 except (asyncio.TimeoutError, TimeoutError):
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    safe_killpg(getattr(proc, "pid", None), signal.SIGKILL)
                     await proc.wait()
                     err = f"{target}: timed out after 600s".encode()
             size = part.stat().st_size
@@ -2963,17 +3177,73 @@ class AndroidPanel(DevicePanel):
     async def server_files(self, ver: str, arch: str) -> list[tuple[Path, str]] | None:
         """One binary, published ready to run."""
         self.prune_cache(ver)
-        local = CACHE / f"frida-server-{ver}-{self.frida_platform}-{arch}"
-        if local.exists() and local.stat().st_size >= MIN_SERVER_BYTES:
-            self.write(f"cached  [b]{local}[/] ({local.stat().st_size // 1024} KiB)")
-        elif not await self.download(
-                f"{FRIDA_RELEASES}/{ver}/frida-server-{ver}-{self.frida_platform}-{arch}.xz",
-                local, pipe=" | xz -d"):
-            return None
-        return [(local, self.server_path)]
+        archs = [arch]
+        if arch == "arm64":
+            archs.append("arm")
+        elif arch == "x86_64":
+            archs.append("x86")
+
+        for a in archs:
+            local = CACHE / f"frida-server-{ver}-{self.frida_platform}-{a}"
+            if local.exists() and local.stat().st_size >= MIN_SERVER_BYTES:
+                self.write(f"cached  [b]{local}[/] ({local.stat().st_size // 1024} KiB)")
+                return [(local, self.server_path)]
+            is_last = (a == archs[-1])
+            url = f"{FRIDA_RELEASES}/{ver}/frida-server-{ver}-{self.frida_platform}-{a}.xz"
+            if await self.download(url, local, pipe=" | xz -d", quiet=not is_last):
+                return [(local, self.server_path)]
+            if not is_last:
+                self.write(f"[dim]{self.frida_platform}-{a} not found, "
+                           f"trying fallback {self.frida_platform}-{archs[-1]}...[/]")
+        return None
 
     async def frida_blocker(self) -> str | None:
         return None if self.root else "frida-server needs root; without it use objection patchapk"
+
+    async def check_art_module(self) -> bool:
+        """Check for Google Play ART update (com.google.android.art), which breaks frida."""
+        if getattr(self, "_art_warned", False):
+            return True
+        rc, out = await self.adb("shell", "pm", "list", "packages", "com.google.android.art")
+        if rc != 0 or "com.google.android.art" not in out:
+            return True
+        self._art_warned = True
+        choice = await self.mob.push_screen_wait(ConfirmScreen(
+            f"ART update detected on {self.serial} (com.google.android.art)",
+            "uninstall update & reboot device (fixes frida/frida#3639)",
+            "continue anyway (frida may crash)",
+        ))
+        if choice:
+            self.write("uninstall com.google.android.art update...")
+            rc, out = await self.adb("shell", "pm", "uninstall", "com.google.android.art")
+            if rc != 0 and self.root:
+                rc, out = await self.adb(
+                    "shell", "su", "-c", "pm uninstall com.google.android.art"
+                )
+            self.write(f"uninstall result: {out.strip() or 'done'}")
+            self.write("rebooting device...")
+            if self.root:
+                await self.adb("shell", "su", "-c", "reboot")
+            else:
+                await self.adb("shell", "reboot")
+            return False
+        self.write("[yellow]warning:[/] com.google.android.art is active"
+                   " — frida may crash (see frida/frida#3639)")
+        return True
+
+    async def clear_app_data(self) -> bool:
+        """Clear all data for the selected app without uninstalling it."""
+        if not self.package:
+            return False
+        self.write(f"clear   [b]{escape(self.package)}[/] (pm clear)...")
+        rc, out = await self.adb("shell", "pm", "clear", self.package)
+        if rc != 0 and self.root:
+            rc, out = await self.adb("shell", "su", "-c", f"pm clear {shlex.quote(self.package)}")
+        if rc == 0 and "success" in out.lower():
+            self.write(f"[dim]cleared app data for {escape(self.package)}")
+            return True
+        self.fail(f"clear data failed: {out.strip() or 'failed'}")
+        return False
 
     async def describe(self) -> None:
         rc, out = await self.adb("shell", "getprop")
@@ -2991,6 +3261,10 @@ class AndroidPanel(DevicePanel):
                       " — the device stopped answering adb; replug it, then r")
         _, who = await self.adb("shell", "su", "-c", "id")
         self.root = "uid=0" in who
+        rc_art, out_art = await self.adb(
+            "shell", "pm", "list", "packages", "com.google.android.art"
+        )
+        self.has_art_module = (rc_art == 0 and "com.google.android.art" in out_art)
         # Escaped: these come from the device. Static.update() has no fallback
         # for bad markup, so a model name containing "[/]" would take the panel
         # down the way logcat lines once took down the log.
@@ -3109,6 +3383,9 @@ class AndroidPanel(DevicePanel):
         self.write(f"  [b]{'root':<8}[/] "
                    + ("[green]yes — su works[/]" if self.root else
                       "[red]no — su is missing or refused[/]"))
+        if getattr(self, "has_art_module", False):
+            self.write(f"  [b]{'art':<8}[/] "
+                       "[yellow]com.google.android.art detected (frida issue #3639)[/]")
 
     async def install(self, path: str) -> tuple[int, str]:
         self.write(f"[dim]$ adb install -r {path}")
@@ -3277,6 +3554,7 @@ class IosPanel(DevicePanel):
         # see load_packages(), package_chosen() and bundle_dir().
         self.executables: dict[str, str] = {}
         self.bundles: dict[str, str] = {}
+        self.data_containers: dict[str, str] = {}
         # The executable the selected app runs as, and the app it was looked
         # up for — None until the first lookup: see package_chosen().
         self.proc_name = ""
@@ -3360,6 +3638,33 @@ class IosPanel(DevicePanel):
         rc, _ = await sh(*self.ssh_argv("-O", "check"), timeout=5)
         return rc == 0
 
+    @staticmethod
+    def is_connection_error(said: str) -> bool:
+        """Whether ssh output indicates a connection failure rather than bad auth."""
+        s = said.lower()
+        return any(
+            err in s
+            for err in (
+                "connection refused",
+                "connection reset",
+                "connection closed",
+                "closed by remote host",
+                "kex_exchange_identification",
+                "no route to host",
+                "network is unreachable",
+                "timed out",
+                "broken pipe",
+                "not answer",
+            )
+        )
+
+    def show_openssh_help(self) -> None:
+        """Instructions to install and enable OpenSSH on jailbroken iOS."""
+        self.write("[bold yellow]To enable SSH on jailbroken iOS:[/]")
+        self.write("  1. Open Sileo, Zebra, or Cydia on the device")
+        self.write("  2. Search for and install [b]'OpenSSH'[/b]")
+        self.write("  3. Ensure sshd is running on port 22, then press [b]r[/] or [b]u[/]")
+
     async def master_up(self) -> bool:
         """Make sure one authenticated connection is open for the rest to use.
 
@@ -3386,6 +3691,11 @@ class IosPanel(DevicePanel):
             if not (said := await self.open_master(self.password)):
                 self.master_said = False
                 return True
+            if self.is_connection_error(said):
+                self.master_said = True
+                self.fail(f"ssh: {said[:120]}")
+                self.show_openssh_help()
+                return False
             # Wrong password, or none yet: ask, once, with the field masked.
             if said.strip():
                 # All of it, not the one line the summary keeps: when ssh is
@@ -3401,6 +3711,8 @@ class IosPanel(DevicePanel):
             if said := await self.open_master(typed):
                 self.master_said = True
                 self.fail(f"ssh: {said[:120]}")
+                if self.is_connection_error(said):
+                    self.show_openssh_help()
                 return False
             self.password, self.master_said = typed, False
             return True
@@ -3783,7 +4095,7 @@ class IosPanel(DevicePanel):
         # "com.foo.bar, "1.0", "Foo"" — the quotes are the tool's own, and the
         # first line it prints is the column names.
         found: set[str] = set()
-        self.executables, self.bundles = {}, {}
+        self.executables, self.bundles, self.data_containers = {}, {}, {}
         # csv, not a plain split on ", ": a quoted field (a display name such
         # as "Words, Inc") contains that exact separator, and a blind split
         # shifted every column after it.
@@ -4136,6 +4448,25 @@ class IosPanel(DevicePanel):
         # tiled: it opens where it opens.
         return ["ioscpy", "--device", self.serial]
 
+    async def mirror_ready(self) -> tuple[bool, str]:
+        """ioscpy requires its server tweak (com.ioscpy.device / ioscpyd) on the phone."""
+        if not await self.master_up():
+            self.write(
+                "[dim]ioscpy requires its server tweak installed on the phone "
+                "(repo: https://lautarovculic.github.io/ioscpy-repo/)[/]"
+            )
+            return True, ""
+        cmd = (
+            f"[ -x {self.jb}/usr/bin/ioscpyd ] || [ -x /usr/bin/ioscpyd ] || "
+            f"[ -f {self.jb}/Library/MobileSubstrate/DynamicLibraries/ioscpyhook.dylib ] || "
+            f"[ -f /Library/MobileSubstrate/DynamicLibraries/ioscpyhook.dylib ] || "
+            "dpkg -s com.ioscpy.device 2>/dev/null | grep -q 'install ok installed'"
+        )
+        rc, _ = await self.run(cmd, root=False)
+        if rc != 0:
+            return False, "server tweak not found on device"
+        return True, ""
+
     async def log_command(self, pid: str) -> list[str]:
         """idevicesyslog, whole, with the pid applied on this side of the cable.
 
@@ -4220,26 +4551,47 @@ class IosPanel(DevicePanel):
         `jb` the rest of this class already keys off.
         """
         self.prune_cache(ver)
-        deb = CACHE / f"frida_{ver}_{self.frida_platform}-{arch}.deb"
-        unpacked = CACHE / f"frida-{ver}-{self.frida_platform}-{arch}"
+        archs = [arch]
+        if arch == "arm64":
+            archs.append("arm")
+
+        deb: Path | None = None
+        unpacked: Path | None = None
+        for a in archs:
+            cur_deb = CACHE / f"frida_{ver}_{self.frida_platform}-{a}.deb"
+            cur_unpacked = CACHE / f"frida-{ver}-{self.frida_platform}-{a}"
+            if cur_unpacked.is_dir():
+                deb, unpacked = cur_deb, cur_unpacked
+                self.write(f"cached  [b]{unpacked}[/]")
+                break
+            fresh = cur_deb.exists() and cur_deb.stat().st_size >= MIN_SERVER_BYTES
+            if fresh:
+                deb, unpacked = cur_deb, cur_unpacked
+                break
+            is_last = (a == archs[-1])
+            url = f"{FRIDA_RELEASES}/{ver}/frida_{ver}_{self.frida_platform}-{a}.deb"
+            if await self.download(url, cur_deb, quiet=not is_last):
+                deb, unpacked = cur_deb, cur_unpacked
+                break
+            if not is_last:
+                self.write(f"[dim]{self.frida_platform}-{a} not found, "
+                           f"trying fallback {self.frida_platform}-{archs[-1]}...[/]")
+
+        if not deb or not unpacked:
+            return None
+
         if not unpacked.is_dir():
-            fresh = deb.exists() and deb.stat().st_size >= MIN_SERVER_BYTES
-            if not fresh and not await self.download(
-                    f"{FRIDA_RELEASES}/{ver}/frida_{ver}_{self.frida_platform}-{arch}.deb", deb):
-                return None
             try:
                 inside = await asyncio.to_thread(unpack_deb, deb, unpacked)
             except (OSError, ValueError, tarfile.TarError) as exc:
                 self._unpack_failed(unpacked, f"{deb.name}: {exc}", deb)
                 return None
             self.write(f"unpack  {len(inside)} files from [b]{deb.name}[/]")
-        else:
-            self.write(f"cached  [b]{unpacked}[/]")
 
         # Find frida-server in unpacked
-        server_local = unpacked / "var/jb/usr/sbin/frida-server"
-        if not server_local.is_file():
-            server_local = next(unpacked.rglob("frida-server"), None)
+        server_candidate = unpacked / "var/jb/usr/sbin/frida-server"
+        server_local = (server_candidate if server_candidate.is_file()
+                        else next(unpacked.rglob("frida-server"), None))
         if not server_local or not server_local.is_file():
             # Left as-is, an unpack interrupted partway through repeats this
             # same failure on every retry, with no unpack ever tried again.
@@ -4272,11 +4624,17 @@ class IosPanel(DevicePanel):
         """
         if not self.package:
             return ""
-        pattern = f"{re.escape(self.package)}([^A-Za-z0-9_.-]|$)"
-        rc, out = await self.run(
-            f"grep -lsE {shlex.quote(pattern)} {plists} 2>/dev/null",
-            timeout=120, root=False)
-        found = [ln.strip() for ln in out.splitlines() if ln.strip().endswith(".plist")]
+        # Fixed string match (-F): in bplist00, the byte immediately following the bundle
+        # identifier string is an object marker byte (often 0x50-0x5F, ASCII 'P'-'_' for the
+        # next key like MCMMetadataUUID), which causes regex word-boundary checks to fail.
+        # Container directories are protected by sandbox entitlements from the mobile user,
+        # so this search must always run as root.
+        cmd = f"grep -alsF {shlex.quote(self.package)} {plists} 2>/dev/null"
+        rc, out = await self.run(cmd, timeout=120, root=True)
+        found = [m.group(1) for ln in out.splitlines()
+                 if "Permission denied" not in ln and "No such file" not in ln
+                 and (m := re.search(r"(/[^\s:]+\.plist)\b", ln.strip()))
+                 and "*" not in m.group(1)]
         # grep is the one thing here that has to be on the phone, and a
         # jailbreak that left it out cannot be told from an app that is not
         # installed unless this is said. Once, and in our own words: what the
@@ -4292,6 +4650,14 @@ class IosPanel(DevicePanel):
                           " directory cannot be searched for", quiet=True)
         elif not found and rc != 0 and out.strip():
             self.write(f"[yellow]{escape(out.strip()[:120])}")
+        if len(found) > 1:
+            for p in found:
+                _, out_p = await self.run(
+                    f"plutil -p {shlex.quote(p)} 2>/dev/null", timeout=10, root=True
+                )
+                if f'"{self.package}"' in out_p or f'=> {self.package}' in out_p:
+                    return p.rsplit("/", 1)[0]
+            return ""
         return found[0].rsplit("/", 1)[0] if found else ""
 
     async def bundle_dir(self) -> str:
@@ -4325,9 +4691,270 @@ class IosPanel(DevicePanel):
         metadata plist with the bundle id inside it, so it can be found the
         same way the bundle already is.
         """
-        return await self.dir_holding(
-            "/var/mobile/Containers/Data/Application/*/"
-            ".com.apple.mobile_container_manager.metadata.plist")
+        if not self.package:
+            return ""
+        if path := self.data_containers.get(self.package):
+            return path
+        for pat in (
+            "/var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist",
+            "/private/var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist",
+        ):
+            if found := await self.dir_holding(pat):
+                self.data_containers[self.package] = found
+                return found
+
+        # Fallback using find in case wildcard glob does not expand in the remote shell
+        grep_flags = self._package_grep_flags()
+        find_cmd = (
+            "find /var/mobile/Containers/Data/Application "
+            "/private/var/mobile/Containers/Data/Application "
+            "-name .com.apple.mobile_container_manager.metadata.plist "
+            f"-exec grep {grep_flags} {{}} + 2>/dev/null"
+        )
+        _, out = await self.run(find_cmd, timeout=120, root=True)
+        found_plists = [m.group(1) for ln in out.splitlines()
+                        if "Permission denied" not in ln and "No such file" not in ln
+                        and (m := re.search(r"(/[^\s:]+\.plist)\b", ln.strip()))
+                        and "*" not in m.group(1)]
+        if found_plists:
+            container = found_plists[0].rsplit("/", 1)[0]
+            self.data_containers[self.package] = container
+            return container
+        return ""
+
+    def _package_grep_flags(self) -> str:
+        return f"-alsF -e {shlex.quote(self.package or '')}"
+
+    async def app_group_dirs(self) -> list[str]:
+        """Find any shared AppGroup containers associated with this package.
+
+        Modern iOS apps frequently store preferences (UserDefaults with suite names)
+        and databases inside shared AppGroup containers rather than their primary
+        data directory.
+        """
+        if not self.package:
+            return []
+        grep_flags = self._package_grep_flags()
+        find_cmd = (
+            "find /var/mobile/Containers/Shared/AppGroup "
+            "/private/var/mobile/Containers/Shared/AppGroup "
+            "-maxdepth 2 -name .com.apple.mobile_container_manager.metadata.plist "
+            f"-exec grep {grep_flags} {{}} + 2>/dev/null"
+        )
+        _, out = await self.run(find_cmd, timeout=30, root=True)
+        found_plists = [m.group(1) for ln in out.splitlines()
+                        if "Permission denied" not in ln and "No such file" not in ln
+                        and (m := re.search(r"(/[^\s:]+\.plist)\b", ln.strip()))
+                        and "*" not in m.group(1)]
+        paths: list[str] = []
+        for p in found_plists:
+            container = p.rsplit("/", 1)[0]
+            if len(found_plists) > 1:
+                _, out_p = await self.run(
+                    f"plutil -p {shlex.quote(p)} 2>/dev/null", timeout=10, root=True
+                )
+                if "MCMMetadataIdentifier" in out_p and not (
+                    f'"{self.package}"' in out_p
+                    or f'=> {self.package}' in out_p
+                    or f'group.{self.package}"' in out_p
+                    or f'group.{self.package}.' in out_p
+                    or f'group.{self.package}\n' in out_p
+                ):
+                    continue
+            if container not in paths:
+                paths.append(container)
+        return paths
+
+    async def all_data_dirs(self) -> list[str]:
+        """Find all matching Data container directories for the selected package.
+
+        An app might have multiple data containers due to reinstallations, extensions,
+        or different container locations. Wiping all of them ensures no stale or active
+        container is left behind.
+        """
+        if not self.package:
+            return []
+        found_dirs: list[str] = []
+        if primary := await self.data_dir():
+            found_dirs.append(primary)
+        grep_flags = self._package_grep_flags()
+        find_cmd = (
+            "find /var/mobile/Containers/Data/Application "
+            "/private/var/mobile/Containers/Data/Application "
+            "/var/mobile/Containers/Data/PluginKitPlugin "
+            "/private/var/mobile/Containers/Data/PluginKitPlugin "
+            "-maxdepth 3 -name .com.apple.mobile_container_manager.metadata.plist "
+            f"-exec grep {grep_flags} {{}} + 2>/dev/null"
+        )
+        _, out = await self.run(find_cmd, timeout=30, root=True)
+        found_plists = [m.group(1) for ln in out.splitlines()
+                        if "Permission denied" not in ln and "No such file" not in ln
+                        and (m := re.search(r"(/[^\s:]+\.plist)\b", ln.strip()))
+                        and "*" not in m.group(1)]
+        for p in found_plists:
+            container = p.rsplit("/", 1)[0]
+            if len(found_plists) > 1:
+                _, out_p = await self.run(
+                    f"plutil -p {shlex.quote(p)} 2>/dev/null", timeout=10, root=True
+                )
+                if "MCMMetadataIdentifier" in out_p and not (
+                    f'"{self.package}"' in out_p
+                    or f'=> {self.package}' in out_p
+                    or f'"{self.package}.' in out_p
+                    or f'=> {self.package}.' in out_p
+                ):
+                    continue
+            if container not in found_dirs:
+                found_dirs.append(container)
+        return found_dirs
+
+    async def clear_app_data(self) -> bool:
+        """Clear all data for the selected app without uninstalling it."""
+        if not self.package:
+            return False
+
+        reserved = {
+            "preferences", "library", "application support", "caches", "webkit",
+            "cookies", "httpstorages", "saved application state", "splashboard",
+            "syncedpreferences", "safari", "keyboard", "mail", "accounts",
+            "identityservices", "logs", "mediastream", "mobileinstallation",
+            "voiceservices", "passbooks", "system", "apple", "springboard",
+            "mobile", "root", "daemon", "server", "cfprefsd", "launchd",
+            "trustd", "securityd", "notifyd", "wifid", "kernel", "ssh",
+            "sshd", "bash", "sh", "zsh", "python", "frida", "frida-server",
+            "objection", "client", "service", "manager", "agent", "helper",
+            "plugin", "extension", "share", "group", "data", "bundle",
+            "application", "test", "main", "debug", "ios", "app",
+        }
+
+        suffix_pat = r"[-._]?(?:app|application|client|ios)$"
+        candidates: list[str] = [self.package]
+        if self.proc_name:
+            candidates.append(self.proc_name)
+            proc_stripped = re.sub(suffix_pat, "", self.proc_name, flags=re.IGNORECASE)
+            if proc_stripped != self.proc_name and len(proc_stripped) >= 3:
+                candidates.append(proc_stripped)
+        else:
+            pkg_parts = self.package.split(".")
+            if len(pkg_parts) > 1 and len(pkg_parts[-1]) >= 3:
+                candidates.append(pkg_parts[-1])
+
+        pkg_stripped = re.sub(suffix_pat, "", self.package, flags=re.IGNORECASE)
+        if pkg_stripped != self.package and len(pkg_stripped) >= 4 and "." in pkg_stripped:
+            candidates.append(pkg_stripped)
+
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for cand in candidates:
+            for variant in (cand, cand.lower()):
+                c = variant.strip()
+                if len(c) >= 3 and c.lower() not in reserved and c not in seen:
+                    seen.add(c)
+                    tokens.append(c)
+
+        if pid := await self.app_pid():
+            await self.run(f"kill -9 {pid}")
+            await asyncio.sleep(0.3)
+
+        bdir = await self.bundle_dir()
+        kill_cmds: list[str] = []
+        if bdir and len(bdir) > 5:
+            kill_cmds.append(f"pkill -9 -f {shlex.quote(bdir)} 2>/dev/null || true")
+
+        for tok in tokens:
+            t_q = shlex.quote(tok)
+            kill_cmds.append(f"killall -9 {t_q} 2>/dev/null || true")
+            kill_cmds.append(f"pkill -9 -x {t_q} 2>/dev/null || true")
+
+        if kill_cmds:
+            await self.run(" ; ".join(kill_cmds))
+        await self.run("killall -9 cfprefsd 2>/dev/null || true")
+
+        data_dirs = await self.all_data_dirs()
+        if not data_dirs and not bdir:
+            self.fail(f"no data container found for {self.package}")
+            return False
+        if data_dirs:
+            self.write(f"clear   [b]{escape(self.package)}[/] in {len(data_dirs)} container(s)...")
+        else:
+            self.write(f"clear   [b]{escape(self.package)}[/] (system/unboxed app)...")
+        target_dirs = list(data_dirs)
+        for gdir in await self.app_group_dirs():
+            if gdir not in target_dirs:
+                target_dirs.append(gdir)
+
+        parts: list[str] = []
+        for d in target_dirs:
+            dq = shlex.quote(d)
+            parts.append(
+                f"(cd {dq} 2>/dev/null && "
+                "find . -mindepth 1 -maxdepth 1 "
+                "! -name .com.apple.mobile_container_manager.metadata.plist "
+                "-exec rm -rf {} + 2>/dev/null && "
+                "mkdir -p Documents Library/Preferences tmp && "
+                "chown -R mobile:mobile Documents Library tmp) || true"
+            )
+
+        base_paths = ("/var/mobile", "/var/root", "/var/jb/var/mobile", "/var/jb/var/root")
+
+        rm_targets: list[str] = []
+        for base in base_paths:
+            for tok in tokens:
+                t_q = shlex.quote(tok)
+                if "." in tok:
+                    rm_targets.append(f"{base}/Library/{t_q}")
+                    rm_targets.append(f"{base}/Library/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Preferences/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Preferences/ByHost/{t_q}.*")
+                rm_targets.append(f"{base}/Library/SyncedPreferences/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Application\\ Support/{t_q}")
+                rm_targets.append(f"{base}/Library/Application\\ Support/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Caches/{t_q}")
+                rm_targets.append(f"{base}/Library/Caches/{t_q}.*")
+                rm_targets.append(f"{base}/Library/WebKit/{t_q}")
+                rm_targets.append(f"{base}/Library/WebKit/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Cookies/{t_q}.*")
+                rm_targets.append(f"{base}/Library/HTTPStorages/{t_q}.*")
+                rm_targets.append(f"{base}/Library/Saved\\ Application\\ State/{t_q}.*")
+                rm_targets.append(f"{base}/Library/SplashBoard/Snapshots/{t_q}.*")
+
+        for tok in tokens:
+            t_q = shlex.quote(tok)
+            for tmp_base in ("/tmp", "/var/tmp", "/var/run", "/var/jb/tmp"):
+                rm_targets.extend([f"{tmp_base}/{t_q}", f"{tmp_base}/{t_q}.*"])
+
+        batch_size = 25
+        for i in range(0, len(rm_targets), batch_size):
+            chunk = " ".join(rm_targets[i : i + batch_size])
+            parts.append(f"rm -rf {chunk} 2>/dev/null || true")
+
+        if self.package == "com.apple.mobilesafari":
+            parts.append(
+                "rm -rf /var/mobile/Library/Safari/History.db* "
+                "/var/mobile/Library/Safari/Bookmarks.db* "
+                "/var/mobile/Library/Safari/SuspendState.plist* "
+                "/var/mobile/Library/Safari/Tabs.db* "
+                "/var/mobile/Library/Safari/BrowserState.db* "
+                "/var/mobile/Library/Safari/CloudTabs.db* "
+                "/var/mobile/Library/Safari/Favicons.db* "
+                "/var/mobile/Library/Safari/PerSitePreferences.db* "
+                "/var/mobile/Library/Safari/ReadingList.db* 2>/dev/null || true"
+            )
+
+        for tok in tokens:
+            if "." in tok or tok == self.proc_name:
+                parts.append(f"defaults delete {shlex.quote(tok)} 2>/dev/null || true")
+
+        parts.append("killall -9 cfprefsd 2>/dev/null || true")
+
+        clean_cmd = " && ".join(parts)
+        rc, out = await self.run(clean_cmd)
+        self.data_containers.pop(self.package, None)
+        if rc == 0:
+            self.write(f"[dim]cleared app data for {escape(self.package)}")
+            return True
+        self.fail(f"clear data failed: {out.strip() or 'failed'}")
+        return False
 
     async def wake_app(self) -> None:
         """Bring the app to the front before anything attaches to it.
@@ -4490,6 +5117,8 @@ class MOABile(App):
                 tooltip="install an apk or ipa picked off the host"),
         Binding("e", "save_app", "export",
                 tooltip="save the selected app's apk or ipa into a host directory you pick"),
+        Binding("x", "clear_app_data", "wipe",
+                tooltip="clear the selected app's data without uninstalling it"),
         Binding("i", "info", "info",
                 tooltip="dump what the device is — build, kernel, storage, network,"
                         " and its root or jailbreak state"),
@@ -4843,6 +5472,9 @@ class MOABile(App):
         try:
             await self.refresh_devices()
             for p in self.panels:
+                if isinstance(p, IosPanel) and not p.root:
+                    p.master_said = False
+                    await p.describe()
                 await p.load_packages()
             self.sync_sidebar()
         finally:
@@ -5011,6 +5643,15 @@ class MOABile(App):
         """Take frida-server off the device entirely, binary and socket."""
         if panel := self.target():
             await panel.purge_frida()
+        elif CLIENTS_CACHE.exists() and any(CLIENTS_CACHE.iterdir()):
+            choice = await self.push_screen_wait(ConfirmScreen(
+                "purge local frida clients",
+                "delete all cached local client environments",
+                "cancel",
+            ))
+            if choice:
+                cleaned = purge_all_client_venvs()
+                self.notify(f"removed {cleaned} local client environment(s)")
 
     @work(group="action")
     async def action_frida_client(self) -> None:
@@ -5072,7 +5713,8 @@ class MOABile(App):
             return
         if target[0] == "-p":            # attaching, so the app has to be awake
             await panel.wake_app()
-        panel.start_tool(["frida", "-D", panel.serial, *target, *extra], label)
+        frida_cmd = await panel.get_frida_cmd()
+        panel.start_tool([frida_cmd, "-D", panel.serial, *target, *extra], label)
 
     @work(group="action")
     async def action_objection(self) -> None:
@@ -5132,8 +5774,80 @@ class MOABile(App):
                 return
         # The label, because the command line now says a number: the pane's
         # border is where "which app is this" gets answered.
-        panel.start_tool(["objection", "-S", panel.serial, "-n", pid, "start"],
+        objection_cmd = await panel.get_objection_cmd()
+        panel.start_tool([objection_cmd, "-S", panel.serial, "-n", pid, "start"],
                          f"objection {panel.package} (pid {pid})")
+
+    def _panel_index(self, panel: DevicePanel) -> int:
+        with contextlib.suppress(Exception):
+            if panel in self.panels:
+                return self.panels.index(panel)
+        return 0
+
+    def _spawn_mirror(self, panel: DevicePanel) -> bool:
+        """Spawn the external screen mirroring process."""
+        i = self._panel_index(panel)
+        log_path = Path(tempfile.gettempdir()) / f"moabile-{panel.mirror_tool}-{panel.serial}.log"
+        try:
+            log_file = open(log_path, "w+b")  # noqa: SIM115
+        except OSError:
+            log_file = None
+        stderr_dest = log_file if log_file is not None else subprocess.DEVNULL
+        try:
+            panel.mirror = subprocess.Popen(
+                panel.mirror_argv(i), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=stderr_dest, start_new_session=True,
+            )
+        except OSError as exc:      # on PATH but not runnable: a bad shebang, no fork
+            if log_file:
+                with contextlib.suppress(OSError):
+                    log_file.close()
+            panel.fail(f"{panel.mirror_tool}: {exc.strerror or exc}")
+            return False
+        panel._mirror_log = log_file
+        return True
+
+    async def _mirror_worker(self, panel: DevicePanel) -> None:
+        """Async worker to verify prerequisites, start mirroring, and catch early exits."""
+        ready, err = await panel.mirror_ready()
+        if not ready:
+            panel.fail(f"{panel.mirror_tool}: {err}")
+            if panel.mirror_tool == "ioscpy":
+                panel.write("[bold yellow]To enable screen mirroring on iOS:[/]")
+                panel.write(
+                    "  1. In Sileo or Zebra, add: [b]https://lautarovculic.github.io/ioscpy-repo/[/]"
+                )
+                panel.write("  2. Install the package [b]'ioscpy'[/] (com.ioscpy.device)")
+                panel.write("  3. Respring the device, then press [b]w[/] again")
+            return
+        if not self._spawn_mirror(panel):
+            return
+        i = self._panel_index(panel)
+        pid = panel.mirror.pid if panel.mirror else "?"
+        panel.write(f"{panel.mirror_tool} window {i + 1} (pid {pid})")
+        # Check if the process exited immediately (e.g. handshake or connection failure)
+        await asyncio.sleep(0.4)
+        if panel.mirror and panel.mirror.poll() is not None:
+            code = panel.mirror.returncode
+            panel.mirror = None
+            err_detail = ""
+            log_file = getattr(panel, "_mirror_log", None)
+            if log_file:
+                with contextlib.suppress(OSError):
+                    log_file.seek(0)
+                    raw = log_file.read().decode(errors="replace").strip()
+                    if raw:
+                        err_detail = raw.splitlines()[-1]
+                with contextlib.suppress(OSError):
+                    log_file.close()
+                panel._mirror_log = None
+            panel.fail(f"{panel.mirror_tool} exited immediately (exit code {code})")
+            if err_detail:
+                panel.write(f"[dim]{panel.mirror_tool}: {err_detail}[/]")
+            if panel.mirror_tool == "ioscpy":
+                panel.write(
+                    "[dim]Ensure the ioscpy tweak is installed and the device was resprung[/]"
+                )
 
     def action_mirror(self) -> None:
         """Toggle the external window that mirrors this device's screen."""
@@ -5142,21 +5856,22 @@ class MOABile(App):
         if panel.mirror and panel.mirror.poll() is None:
             reap(panel.mirror)
             panel.mirror = None
+            if getattr(panel, "_mirror_log", None):
+                with contextlib.suppress(Exception):
+                    panel._mirror_log.close()
+                panel._mirror_log = None
             panel.write(f"[dim]{panel.mirror_tool} closed")
             return
         if not shutil.which(panel.mirror_tool):
             panel.fail(f"{panel.mirror_tool} is not installed")
             return
-        i = self.panels.index(panel)
-        try:
-            panel.mirror = subprocess.Popen(
-                panel.mirror_argv(i), stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-            )
-        except OSError as exc:      # on PATH but not runnable: a bad shebang, no fork
-            panel.fail(f"{panel.mirror_tool}: {exc.strerror or exc}")
-            return
-        panel.write(f"{panel.mirror_tool} window {i + 1} (pid {panel.mirror.pid})")
+        if self.is_running:
+            self.run_worker(self._mirror_worker(panel), group="action")
+        else:
+            if self._spawn_mirror(panel):
+                i = self._panel_index(panel)
+                pid = panel.mirror.pid if panel.mirror else "?"
+                panel.write(f"{panel.mirror_tool} window {i + 1} (pid {pid})")
 
     @work(group="action")
     async def action_shell(self) -> None:
@@ -5317,6 +6032,21 @@ class MOABile(App):
             await panel.save_app(dest)
 
     @work(group="action")
+    async def action_clear_app_data(self) -> None:
+        """Clear all data for the selected app without uninstalling it."""
+        if not (panel := self.target()):
+            return
+        if not panel.package:
+            panel.fail(NO_APP)
+            return
+        if not await self.push_screen_wait(ConfirmScreen(
+                f"clear data for {panel.package} on {panel.serial}?",
+                "wipe all app data and cache (keep app installed)",
+                "cancel")):
+            return
+        await panel.clear_app_data()
+
+    @work(group="action")
     async def action_info(self) -> None:
         if panel := self.target():
             await panel.system_info()
@@ -5367,6 +6097,17 @@ class MOABile(App):
     def action_screenshot(self) -> None:  # type: ignore[override]
         """An SVG of the interface, after a beat so the key press has settled."""
         self.set_timer(0.1, self.deliver_screenshot)
+
+    @on(events.DeliveryComplete)
+    def _on_delivery_complete(self, event: events.DeliveryComplete) -> None:
+        """Handle a successfully delivered screenshot without markup glitches."""
+        event.prevent_default()
+        event.stop()
+        if event.name == "screenshot":
+            if event.path is None:
+                self.notify("Saved screenshot", title="Screenshot")
+            else:
+                self.notify(f"Saved screenshot to {event.path}", title="Screenshot")
 
     def action_theme(self) -> None:
         dark, light = KEEP_THEMES

@@ -17,7 +17,9 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -25,7 +27,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from textual import events
 
@@ -74,6 +76,8 @@ case "$flat" in
                                # own too, which is not what the sidebar asks for.
                                echo "package:com.android.settings"
                                echo "package:com.target.app"; exit 0;;
+  "shell pm clear"*|"shell su -c pm clear"*)
+                                echo "Success"; exit 0;;
   "shell pm path"*)            echo "package:/data/app/~~ab==/com.target.app-1/base.apk"
                                echo "package:/data/app/~~ab==/com.target.app-1/split_config.arm64.apk";;
   "install -r"*)               [[ -f "{TMP}/resigned" ]] && {{
@@ -435,11 +439,11 @@ case "$script" in
                         # matched anywhere in the line, and the wrong one.
                         echo " 4322 /var/containers/Bundle/Application/AA-BB/Target.app/TargetHelper"
                         exit 0;;
-  "grep -ls"*metadata.plist*)
+  "grep -"*"metadata.plist"*)
                         (( onpath )) || {{ echo "sh: grep: not found" >&2; exit 127; }}
                         echo "/var/mobile/Containers/Data/Application/CC-DD/.com.apple.mobile_container_manager.metadata.plist"
                         exit 0;;
-  "grep -ls"*)          (( onpath )) || {{ echo "sh: grep: not found" >&2; exit 127; }}
+  "grep -"*)            (( onpath )) || {{ echo "sh: grep: not found" >&2; exit 127; }}
                         # A phone with no grep at all, saying nothing: the
                         # 2>/dev/null the panel sends takes the shell's own
                         # "not found" with the glob noise it is there for, so
@@ -462,6 +466,8 @@ case "$script" in
                         [[ -f "{TMP}/ios-open-needs-root" && "$args" != *sudo* ]] && {{
                           echo "open: Operation not permitted" >&2; exit 1; }}
                         echo "$script" >> "{TMP}/ios-open"; touch "{TMP}/ios-running"; exit 0;;
+  *"ioscpyd"*|*"ioscpyhook"*|*"com.ioscpy.device"*)
+                        [[ -f "{TMP}/ios-no-ioscpy" ]] && exit 1; exit 0;;
   *)                    exit 0;;
 esac
 """
@@ -867,6 +873,10 @@ async def _async_obj(v: object) -> object:
     return v
 
 
+async def _async_list(v: list[str]) -> list[str]:
+    return v
+
+
 class StubPanel(moabile.DevicePanel):
     async def copy_in(self, local: str, remote: str) -> tuple[int, str]: return 0, "ok"
     @property
@@ -879,6 +889,7 @@ class StubPanel(moabile.DevicePanel):
     async def install(self, path: str) -> tuple[int, str]: return 0, "ok"
     async def existing_exports(self, dest: str) -> list[Path]: return []
     async def save_app(self, into: str) -> None: pass
+    async def clear_app_data(self) -> bool: return True
     async def shell_argv(self) -> tuple[list[str], str]: return ["sh"], ""
     def mirror_argv(self, port: int) -> list[str]: return ["mirror"]
     async def log_command(self, pid: str) -> list[str]: return ["log"]
@@ -938,6 +949,7 @@ async def test_edge_cases() -> None:
         (dp_raw.install, ("",)),
         (dp_raw.existing_exports, ("",)),
         (dp_raw.save_app, ("",)),
+        (dp_raw.clear_app_data, ()),
         (dp_raw.shell_argv, ()),
         (dp_raw.log_command, ("",)),
         (dp_raw.app_pid, ()),
@@ -964,7 +976,7 @@ async def test_edge_cases() -> None:
     assert await dp.frida_blocker() is None
     assert dp.summary() == ""
     assert dp.cpu == "?"
-    assert moabile.VERSION == "1.1.1"
+    assert moabile.VERSION == "1.2.0"
 
     # Log filter edge cases: case-insensitivity, history retention, regex escaping
     dp.log_history.clear()
@@ -982,9 +994,9 @@ async def test_edge_cases() -> None:
     tv = moabile.TextViewerScreen("Title", "line1\nline2")
     assert tv.title_text == "Title"
     assert tv.content_text == "line1\nline2"
-    tv.dismiss = lambda r=None: setattr(tv, "_dismissed", True)
-    tv.action_dismiss_viewer()
-    assert getattr(tv, "_dismissed", False) is True
+    with patch.object(tv, "dismiss") as mock_dismiss:
+        tv.action_dismiss_viewer()
+        assert mock_dismiss.called
 
     # TerminalPane pause on exit
     tp = moabile.TerminalPane(dp)
@@ -1040,7 +1052,7 @@ async def test_edge_cases() -> None:
     # ensure_frida custom version choice when no server on device
     dp.mob.push_screen_wait = lambda s: (
         _async_str("c") if isinstance(s, moabile.ConfirmScreen)
-        else _async_str("16.2.1")
+        else _async_str("15.2.2")
     )
     dp.server_files = lambda v, a: _async_none()
     assert await dp.ensure_frida() is False
@@ -1070,14 +1082,22 @@ async def test_edge_cases() -> None:
     moabile.sh = lambda *a, **kw: _async_tuple((0, "16.5.9")) if a[0] == "frida" else sh_orig(*a, **kw)
     try:
         await dp.warn_drift()
+        fake_bin = moabile.client_frida_bin("12.0.0")
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.touch()
+        await dp.warn_drift()
+        shutil.rmtree(fake_bin.parent.parent, ignore_errors=True)
     finally:
         moabile.sh = sh_orig
 
-    # 9. prune_cache with stale dir
+    # 9. prune_cache with stale dir and clients dir preservation
     stale_dir = moabile.CACHE / "frida-stale-test"
     stale_dir.mkdir(parents=True, exist_ok=True)
+    clients_dir = moabile.CLIENTS_CACHE
+    clients_dir.mkdir(parents=True, exist_ok=True)
     dp.prune_cache("16.5.9")
     assert not stale_dir.exists()
+    assert clients_dir.exists()
 
     # 10. start_stream with OSError
     dp.start_stream("fail_stream", "/nonexistent_cmd_xyz_123")
@@ -1163,27 +1183,85 @@ async def test_edge_cases() -> None:
     ios.package = None
     assert await ios.dir_holding("/var/plists") == ""
 
-    # Prefix collision: grep regex must target the exact package identifier
     calls: list[str] = []
     ios.package = "app.com.1"
     ios.run = lambda cmd, **kw: (calls.append(cmd), _async_tuple((0, "/var/containers/Bundle/Application/AA/App.app/Info.plist\n")))[1]  # type: ignore[assignment]
     res = await ios.dir_holding("/var/plists")
     assert res == "/var/containers/Bundle/Application/AA/App.app", res
     assert len(calls) == 1
-    assert "app\\.com\\.1([^A-Za-z0-9_.-]|$)" in calls[0], calls[0]
+    assert "app.com.1" in calls[0], calls[0]
+    assert "-alsF" in calls[0]
 
-    # Real plist grep test (both binary and XML formats) with prefix collision
+    # Binary match line extraction
+    ios.run = lambda *a, **kw: _async_tuple((0, "Binary file /var/mobile/Containers/Data/Application/XYZ/.com.apple.mobile_container_manager.metadata.plist matches\n"))  # type: ignore[assignment]
+    assert await ios.dir_holding("/var/plists") == "/var/mobile/Containers/Data/Application/XYZ"
+
+    # Disambiguation with plutil -p when multiple files match
+    multi_out = "/var/mobile/Containers/Data/Application/111/.metadata.plist\n/var/mobile/Containers/Data/Application/222/.metadata.plist\n"
+    def fake_multi(cmd, **kw):
+        if "plutil -p" in cmd and "222" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "app.com.1"\n}\n'))
+        if "plutil -p" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "app.com.1.other"\n}\n'))
+        return _async_tuple((0, multi_out))
+    ios.run = fake_multi  # type: ignore[assignment]
+    assert await ios.dir_holding("/var/plists") == "/var/mobile/Containers/Data/Application/222"
+    ios.package = "app.com.nomatch"
+    assert await ios.dir_holding("/var/plists") == ""
+    ios.package = "app.com.1"
+
+    # Unexpanded wildcard in grep output is ignored
+    ios.run = lambda *a, **kw: _async_tuple((0, "grep: /var/mobile/*/.plist: No such file or directory\n"))  # type: ignore[assignment]
+    assert await ios.dir_holding("/var/plists") == ""
+
+    # Real plist grep test (both binary and XML formats) with -F
     import plistlib
     f_short = Path(TMP) / "short.plist"
     f_long = Path(TMP) / "long.plist"
     for fmt in (plistlib.FMT_BINARY, plistlib.FMT_XML):
-        f_short.write_bytes(plistlib.dumps({"CFBundleIdentifier": "app.com.1"}, fmt=fmt))
-        f_long.write_bytes(plistlib.dumps({"CFBundleIdentifier": "app.com.1.test"}, fmt=fmt))
-        pattern = f"{re.escape('app.com.1')}([^A-Za-z0-9_.-]|$)"
-        rc, out = await moabile.sh("sh", "-c", f"grep -lsE {shlex.quote(pattern)} {f_short} {f_long} 2>/dev/null")
-        assert rc == 0 and out.strip().splitlines() == [str(f_short)], (fmt, out)
+        f_short.write_bytes(plistlib.dumps({"MCMMetadataIdentifier": "app.com.1", "MCMMetadataUUID": "111"}, fmt=fmt))
+        f_long.write_bytes(plistlib.dumps({"MCMMetadataIdentifier": "app.com.1.test", "MCMMetadataUUID": "222"}, fmt=fmt))
+        rc, out = await moabile.sh("sh", "-c", f"grep -alsF 'app.com.1.test' {f_short} {f_long} 2>/dev/null")
+        assert rc == 0 and out.strip().splitlines() == [str(f_long)], (fmt, out)
     f_short.unlink(missing_ok=True)
     f_long.unlink(missing_ok=True)
+
+    # data_dir tests
+    ios.package = None
+    assert await ios.data_dir() == ""
+    ios.package = "com.test.data"
+    ios.data_containers["com.test.data"] = "/cached/path"
+    assert await ios.data_dir() == "/cached/path"
+    ios.data_containers.clear()
+
+    orig_dir_holding = ios.dir_holding
+    try:
+        # First pattern matches
+        ios.dir_holding = lambda pat: _async_str("/data/first" if "/var/mobile" in pat else "")  # type: ignore[assignment]
+        assert await ios.data_dir() == "/data/first"
+        assert ios.data_containers.get("com.test.data") == "/data/first"
+        ios.data_containers.clear()
+
+        # Second pattern matches
+        ios.dir_holding = lambda pat: _async_str("/data/second" if "/private/var" in pat else "")  # type: ignore[assignment]
+        assert await ios.data_dir() == "/data/second"
+        assert ios.data_containers.get("com.test.data") == "/data/second"
+        ios.data_containers.clear()
+
+        # Neither pattern matches, find fallback matches (with pkg_stripped)
+        ios.package = "com.test.dataApp"
+        ios.dir_holding = lambda pat: _async_str("")  # type: ignore[assignment]
+        ios.run = lambda cmd, **kw: _async_tuple((0, "/var/mobile/Containers/Data/Application/FIND_UUID/.com.apple.mobile_container_manager.metadata.plist\n"))  # type: ignore[assignment]
+        assert await ios.data_dir() == "/var/mobile/Containers/Data/Application/FIND_UUID"
+        assert ios.data_containers.get("com.test.dataApp") == "/var/mobile/Containers/Data/Application/FIND_UUID"
+        ios.data_containers.clear()
+
+        # Both fail (with pkg_stripped == package)
+        ios.package = "com.test.data"
+        ios.run = lambda cmd, **kw: _async_tuple((1, ""))  # type: ignore[assignment]
+        assert await ios.data_dir() == ""
+    finally:
+        ios.dir_holding = orig_dir_holding
 
     ios.run = lambda *a, **kw: _async_tuple((1, "some grep error"))
     await ios.dir_holding("/var/plists")
@@ -1270,6 +1348,8 @@ async def test_edge_cases() -> None:
 
     # Test copy_to_clipboard on MOABile
     app_cli = moabile.MOABile()
+    from textual._context import active_app
+    active_token = active_app.set(app_cli)
     app_cli.copy_to_clipboard("test_text")
     assert app_cli._clipboard == "test_text"
 
@@ -1281,8 +1361,9 @@ async def test_edge_cases() -> None:
             info.size = 10
             tar.addfile(info, io.BytesIO(b"0123456789"))
     deb_17 = moabile.CACHE / "frida_17.17.0_iphoneos-arm64.deb"
-    deb_17.parent.mkdir(parents=True, exist_ok=True)
-    deb_17.write_bytes(b"!<arch>\n" + ar_member("data.tar", inner_tar.getvalue()))
+    deb_17.write_bytes(
+        b"!<arch>\n" + ar_member("data.tar", inner_tar.getvalue()) + b"\0" * moabile.MIN_SERVER_BYTES
+    )
     unpacked_17 = moabile.CACHE / "frida-17.17.0-iphoneos-arm64"
     shutil.rmtree(unpacked_17, ignore_errors=True)
     files_17 = await ios.server_files("17.17.0", "arm64")
@@ -1292,6 +1373,1174 @@ async def test_edge_cases() -> None:
     deb_17.unlink(missing_ok=True)
     shutil.rmtree(unpacked_17, ignore_errors=True)
 
+    # Architecture fallback for iOS (arm64 -> arm)
+    calls_ios_dl: list[str] = []
+
+    async def mock_ios_dl(url: str, into: Path, quiet: bool = False, **kw: Any) -> bool:
+        calls_ios_dl.append(url)
+        if "iphoneos-arm.deb" in url:
+            into.write_bytes(b"!<arch>\n" + ar_member("data.tar", inner_tar.getvalue()))
+            return True
+        return False
+
+    ios.download = mock_ios_dl
+    unpacked_fb = moabile.CACHE / "frida-15.2.2-iphoneos-arm"
+    shutil.rmtree(unpacked_fb, ignore_errors=True)
+    res_fallback = await ios.server_files("15.2.2", "arm64")
+    assert res_fallback is not None
+    assert any("iphoneos-arm64.deb" in u for u in calls_ios_dl)
+    assert any("iphoneos-arm.deb" in u for u in calls_ios_dl)
+    shutil.rmtree(unpacked_fb, ignore_errors=True)
+    (moabile.CACHE / "frida_15.2.2_iphoneos-arm.deb").unlink(missing_ok=True)
+
+    # Architecture fallback for Android (arm64 -> arm, x86_64 -> x86)
+    android_panel = moabile.AndroidPanel(dp.mob, "serial_and")
+    calls_and_dl: list[str] = []
+
+    async def mock_and_dl(url: str, into: Path, quiet: bool = False, **kw: Any) -> bool:
+        calls_and_dl.append(url)
+        if "android-arm.xz" in url or "android-x86.xz" in url:
+            into.write_bytes(b"x" * 2_000_000)
+            return True
+        return False
+
+    android_panel.download = mock_and_dl
+    res_and_arm = await android_panel.server_files("15.2.2", "arm64")
+    assert res_and_arm is not None
+    assert any("android-arm64.xz" in u for u in calls_and_dl)
+    assert any("android-arm.xz" in u for u in calls_and_dl)
+    (moabile.CACHE / "frida-server-15.2.2-android-arm").unlink(missing_ok=True)
+
+    res_and_x86 = await android_panel.server_files("15.2.2", "x86_64")
+    assert res_and_x86 is not None
+    assert any("android-x86_64.xz" in u for u in calls_and_dl)
+    assert any("android-x86.xz" in u for u in calls_and_dl)
+    (moabile.CACHE / "frida-server-15.2.2-android-x86").unlink(missing_ok=True)
+
+    android_panel.download = lambda *a, **kw: _async_bool(False)
+    assert await android_panel.server_files("15.2.2", "arm64") is None
+
+    # Client venvs and purge
+    moabile.CLIENTS_CACHE.mkdir(parents=True, exist_ok=True)
+    fake_v = moabile.client_venv_dir("99.99.99")
+    fake_v.mkdir(parents=True, exist_ok=True)
+    assert moabile.client_frida_bin("99.99.99") == fake_v / "bin" / "frida"
+    assert moabile.client_objection_bin("99.99.99") == fake_v / "bin" / "objection"
+    assert moabile.purge_client_venv("99.99.99") is True
+    assert moabile.purge_client_venv("99.99.99") is False
+
+    fake_v1 = moabile.client_venv_dir("1.1.1")
+    fake_v2 = moabile.client_venv_dir("2.2.2")
+    fake_v1.mkdir(parents=True, exist_ok=True)
+    fake_v2.mkdir(parents=True, exist_ok=True)
+    assert moabile.purge_all_client_venvs() >= 2
+
+    # ensure_client_venv branches
+    v_exist = moabile.client_venv_dir("10.0.0")
+    b_exist = moabile.client_frida_bin("10.0.0")
+    b_exist.parent.mkdir(parents=True, exist_ok=True)
+    b_exist.touch()
+    logs: list[str] = []
+    assert await moabile.ensure_client_venv("10.0.0", logs.append) == b_exist
+    assert not logs
+    shutil.rmtree(v_exist, ignore_errors=True)
+
+    with patch.object(Path, "mkdir", side_effect=OSError("denied")):
+        assert await moabile.ensure_client_venv("10.0.1", logs.append) is None
+        assert any("cannot create cache dir" in m for m in logs)
+    logs.clear()
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", return_value=(1, "uv failed")):
+        assert await moabile.ensure_client_venv("10.0.2", logs.append) is None
+        assert any("uv venv failed" in m for m in logs)
+    logs.clear()
+
+    async def fake_uv_fail_bin(*cmd: str, **kw: object) -> tuple[int, str]:
+        return 0, "ok"
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", side_effect=fake_uv_fail_bin):
+        assert await moabile.ensure_client_venv("10.0.3", logs.append) is None
+        assert any("failed to install frida 10.0.3 client" in m for m in logs)
+    logs.clear()
+
+    v_target4 = moabile.client_venv_dir("10.0.4")
+    f_target4 = moabile.client_frida_bin("10.0.4")
+
+    async def fake_uv_success(*cmd: str, **kw: object) -> tuple[int, str]:
+        if "pip" in cmd:
+            f_target4.parent.mkdir(parents=True, exist_ok=True)
+            f_target4.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", side_effect=fake_uv_success):
+        assert await moabile.ensure_client_venv("10.0.4", logs.append) == f_target4
+        assert any("frida 10.0.4 client ready" in m for m in logs)
+    shutil.rmtree(v_target4, ignore_errors=True)
+    logs.clear()
+
+    # ensure_client_venv with uv minor series fallback
+    v_target_17 = moabile.client_venv_dir("17.0.0")
+    f_target_17 = moabile.client_frida_bin("17.0.0")
+    uv_attempts: list[list[str]] = []
+
+    async def fake_uv_fallback(*cmd: str, **kw: object) -> tuple[int, str]:
+        uv_attempts.append(list(cmd))
+        if "pip" in cmd and "frida==17.0.0" in cmd:
+            return 1, "conflict with frida-tools"
+        if "pip" in cmd:
+            f_target_17.parent.mkdir(parents=True, exist_ok=True)
+            f_target_17.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", side_effect=fake_uv_fallback):
+        assert await moabile.ensure_client_venv("17.0.0", logs.append) == f_target_17
+        assert any("frida>=17.0.0,<17.1.0" in str(att) for att in uv_attempts)
+    shutil.rmtree(v_target_17, ignore_errors=True)
+    logs.clear()
+
+    # ensure_client_venv with major range fallback and non-numeric version
+    v_target_maj = moabile.client_venv_dir("18.0.0")
+    f_target_maj = moabile.client_frida_bin("18.0.0")
+
+    async def fake_uv_major_fallback(*cmd: str, **kw: object) -> tuple[int, str]:
+        if "pip" in cmd and ("frida==18.0.0" in cmd or "frida>=18.0.0,<18.1.0" in cmd):
+            return 1, "minor failed"
+        if "pip" in cmd:
+            f_target_maj.parent.mkdir(parents=True, exist_ok=True)
+            f_target_maj.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", side_effect=fake_uv_major_fallback):
+        assert await moabile.ensure_client_venv("18.0.0", logs.append) == f_target_maj
+    shutil.rmtree(v_target_maj, ignore_errors=True)
+
+    # non-numeric version skips minor/major candidate building
+    v_target_non = moabile.client_venv_dir("nonnumeric")
+    f_target_non = moabile.client_frida_bin("nonnumeric")
+
+    async def fake_uv_nonnumeric(*cmd: str, **kw: object) -> tuple[int, str]:
+        if "pip" in cmd:
+            f_target_non.parent.mkdir(parents=True, exist_ok=True)
+            f_target_non.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value="/usr/bin/uv"), \
+         patch("moabile.sh", side_effect=fake_uv_nonnumeric):
+        assert await moabile.ensure_client_venv("nonnumeric", logs.append) == f_target_non
+    shutil.rmtree(v_target_non, ignore_errors=True)
+    logs.clear()
+
+    with patch("shutil.which", return_value=None), \
+         patch("moabile.sh", return_value=(1, "venv failed")):
+        assert await moabile.ensure_client_venv("10.0.5", logs.append) is None
+        assert any("venv creation failed" in m for m in logs)
+    logs.clear()
+
+    v_target6 = moabile.client_venv_dir("10.0.6")
+    f_target6 = moabile.client_frida_bin("10.0.6")
+
+    async def fake_venv_success(*cmd: str, **kw: object) -> tuple[int, str]:
+        if "pip" in cmd[0]:
+            f_target6.parent.mkdir(parents=True, exist_ok=True)
+            f_target6.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value=None), \
+         patch("moabile.sh", side_effect=fake_venv_success):
+        assert await moabile.ensure_client_venv("10.0.6", logs.append) == f_target6
+    shutil.rmtree(v_target6, ignore_errors=True)
+
+    # venv fallback when objection conflicts
+    v_target_fb = moabile.client_venv_dir("10.0.7")
+    f_target_fb = moabile.client_frida_bin("10.0.7")
+
+    async def fake_venv_fallback(*cmd: str, **kw: object) -> tuple[int, str]:
+        if "pip" in cmd[0] and "objection" in cmd and len(cmd) > 4:
+            return 1, "conflict"
+        if "pip" in cmd[0]:
+            f_target_fb.parent.mkdir(parents=True, exist_ok=True)
+            f_target_fb.touch()
+        return 0, "ok"
+
+    with patch("shutil.which", return_value=None), \
+         patch("moabile.sh", side_effect=fake_venv_fallback):
+        assert await moabile.ensure_client_venv("10.0.7", logs.append) == f_target_fb
+    shutil.rmtree(v_target_fb, ignore_errors=True)
+
+    # get_frida_cmd and get_objection_cmd on DevicePanel
+    dp.frida_version = ""
+    assert await dp.get_frida_cmd() == "frida"
+    assert await dp.get_objection_cmd() == "objection"
+
+    dp.frida_version = "16.5.9"
+    with patch("moabile.sh", return_value=(0, "16.5.9")):
+        assert await dp.get_frida_cmd() == "frida"
+
+    dp.frida_version = "15.2.0"
+    v_15 = moabile.client_venv_dir("15.2.0")
+    b_15 = moabile.client_frida_bin("15.2.0")
+    b_15.parent.mkdir(parents=True, exist_ok=True)
+    b_15.touch()
+    obj_15 = moabile.client_objection_bin("15.2.0")
+    obj_15.touch()
+    try:
+        with patch("moabile.sh", return_value=(0, "16.5.9")):
+            assert await dp.get_frida_cmd() == str(b_15)
+            assert await dp.get_objection_cmd() == str(obj_15)
+        with patch("moabile.sh", return_value=(0, "16.5.9")), \
+             patch("moabile.ensure_client_venv", return_value=None):
+            assert await dp.get_frida_cmd() == "frida"
+            assert await dp.get_objection_cmd() == str(obj_15)
+        with patch("moabile.sh", return_value=(0, "15.2.0")), \
+             patch("shutil.which", return_value="/bin/objection"), \
+             patch("moabile.client_objection_bin", return_value=Path("/nonexistent")):
+            assert await dp.get_objection_cmd() == "objection"
+    finally:
+        shutil.rmtree(v_15, ignore_errors=True)
+    dp.frida_version = "15.9.9"
+    v_new = moabile.client_venv_dir("15.9.9")
+    obj_new = moabile.client_objection_bin("15.9.9")
+    try:
+        with patch("moabile.ensure_client_venv", return_value=None):
+            assert await dp.get_objection_cmd() == "objection"
+
+        async def fake_ensure(v: str, log: object) -> Path:
+            obj_new.parent.mkdir(parents=True, exist_ok=True)
+            obj_new.touch()
+            return obj_new
+
+        with patch("moabile.ensure_client_venv", side_effect=fake_ensure):
+            assert await dp.get_objection_cmd() == str(obj_new)
+    finally:
+        shutil.rmtree(v_new, ignore_errors=True)
+    dp.frida_version = ""
+
+    # purge_frida on DevicePanel
+    dp.junk_files = lambda: "/tmp/junk"
+    dp.do_purge = lambda **kw: _async_none()
+    dp.mob.push_screen_wait = lambda s: _async_str("a")
+    fake_v = moabile.client_venv_dir("88.88.88")
+    fake_v.mkdir(parents=True, exist_ok=True)
+    await dp.purge_frida()
+    assert not fake_v.exists()
+
+    fake_v = moabile.client_venv_dir("77.77.77")
+    fake_v.mkdir(parents=True, exist_ok=True)
+    dp.frida_version = "77.77.77"
+    dp.mob.push_screen_wait = lambda s: _async_bool(True)
+    await dp.purge_frida()
+    assert fake_v.exists()
+    assert moabile.purge_client_venv("77.77.77") is True
+    assert not fake_v.exists()
+
+    dp.mob.push_screen_wait = lambda s: _async_bool(False)
+    await dp.purge_frida()
+    dp.frida_version = ""
+
+    # ConfirmScreen extra key callback
+    cs = moabile.ConfirmScreen("q", "y", "n", extra=("a", "all"))
+    cs.dismiss = lambda res: setattr(cs, "res", res)
+    cs.action_custom()
+    assert cs.res == "a"
+    cs.res = None
+    cs.on_key(events.Key("a", "a"))
+    assert cs.res == "a"
+
+    # check_art_module on Android
+    ap._art_warned = True
+    assert await ap.check_art_module() is True
+
+    ap._art_warned = False
+    ap.adb = lambda *a, **kw: _async_tuple((0, "package:com.android.providers.telephony"))
+    assert await ap.check_art_module() is True
+
+    ap._art_warned = False
+    ap.root = True
+    adb_art_cmds: list[tuple[object, ...]] = []
+
+    async def fake_art_adb(*args: object, **kw: object) -> tuple[int, str]:
+        adb_art_cmds.append(args)
+        if "list" in args:
+            return 0, "package:com.google.android.art"
+        if args == ("shell", "pm", "uninstall", "com.google.android.art"):
+            return 1, "Failure [DELETE_FAILED_INTERNAL_ERROR]"
+        if "su" in args and "pm uninstall" in str(args):
+            return 0, "Success"
+        return 0, ""
+
+    ap.adb = fake_art_adb
+    ap.mob.push_screen_wait = lambda s: _async_bool(True)
+    assert await ap.check_art_module() is False
+    assert any("reboot" in str(c) for c in adb_art_cmds)
+
+    ap._art_warned = False
+    ap.root = False
+    adb_art_cmds.clear()
+    assert await ap.check_art_module() is False
+    assert any("reboot" in str(c) for c in adb_art_cmds)
+
+    ap._art_warned = False
+    ap.mob.push_screen_wait = lambda s: _async_bool(False)
+    assert await ap.check_art_module() is True
+    assert ap._art_warned is True
+
+    # ensure_frida aborted by check_art_module
+    with patch.object(ap, "check_art_module", return_value=False):
+        assert await ap.ensure_frida() is False
+
+    # system_info with has_art_module
+    ap.has_art_module = True
+    ap.root = True
+    ap.adb = lambda *a, **kw: _async_tuple((0, "@proxy\nnone\n"))
+    await ap.system_info()
+    ap.has_art_module = False
+
+    # clear_app_data on Android
+    ap.package = "com.target.app"
+    ap.root = True
+    adb_clear_calls: list[str] = []
+
+    async def fake_clear_adb(*args: object, **kw: object) -> tuple[int, str]:
+        adb_clear_calls.append(" ".join(str(a) for a in args))
+        if "su" not in args:
+            return 1, "failed"
+        return 0, "Success"
+
+    ap.adb = fake_clear_adb
+    assert await ap.clear_app_data() is True
+    assert any("su" in c for c in adb_clear_calls)
+
+    ap.root = False
+    ap.adb = lambda *a, **kw: _async_tuple((1, "failed"))
+    assert await ap.clear_app_data() is False
+    ap.package = ""
+    assert await ap.clear_app_data() is False
+
+    # IosPanel app_group_dirs
+    ios.package = ""
+    assert await ios.app_group_dirs() == []
+    ios.package = "com.target.app"
+    mock_grp = (
+        "Permission denied\n"
+        "No such file or directory\n"
+        "/var/mobile/Containers/Shared/AppGroup/*/bad.plist\n"
+        "/var/mobile/Containers/Shared/AppGroup/UUID1/.com.apple.mobile_container_manager.metadata.plist\n"
+        "/var/mobile/Containers/Shared/AppGroup/UUID1/.com.apple.mobile_container_manager.metadata.plist\n"
+        "/var/mobile/Containers/Shared/AppGroup/UUID2/.com.apple.mobile_container_manager.metadata.plist\n"
+    )
+    ios.run = lambda *a, **kw: _async_tuple((0, mock_grp))
+    assert await ios.app_group_dirs() == [
+        "/var/mobile/Containers/Shared/AppGroup/UUID1",
+        "/var/mobile/Containers/Shared/AppGroup/UUID2",
+    ]
+
+    # Disambiguation with plutil -p when multiple app group plists match
+    multi_grp = (
+        "/var/mobile/Containers/Shared/AppGroup/UUID1/.com.apple.mobile_container_manager.metadata.plist\n"
+        "/var/mobile/Containers/Shared/AppGroup/UUID2/.com.apple.mobile_container_manager.metadata.plist\n"
+    )
+    def fake_grp_multi(cmd, **kw):
+        if "plutil -p" in cmd and "UUID1" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "group.com.target.app"\n}\n'))
+        if "plutil -p" in cmd and "UUID2" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "group.com.target.apphelper"\n}\n'))
+        return _async_tuple((0, multi_grp))
+    ios.run = fake_grp_multi  # type: ignore[assignment]
+    assert await ios.app_group_dirs() == ["/var/mobile/Containers/Shared/AppGroup/UUID1"]
+
+    # clear_app_data on iOS
+    ios.package = "com.target.app"
+    ios.proc_name = "TargetApp"
+    ios_calls: list[str] = []
+    ios.app_pid = lambda: _async_str("9999")
+    ios.run = lambda cmd, **kw: (ios_calls.append(cmd), _async_tuple((0, "ok")))[1]
+    ios.data_dir = lambda: _async_str("/var/mobile/Containers/Data/Application/XYZ")
+    ios.app_group_dirs = lambda: _async_list([
+        "/var/mobile/Containers/Shared/AppGroup/GRP1",
+        "/var/mobile/Containers/Data/Application/XYZ",
+    ])
+    assert await ios.clear_app_data() is True
+    assert any("kill -9 9999" in c for c in ios_calls)
+    assert any("killall -9 TargetApp" in c for c in ios_calls)
+    assert any("cfprefsd" in c for c in ios_calls)
+    assert any("GRP1" in c for c in ios_calls)
+    assert any("XYZ" in c for c in ios_calls)
+
+    # clear_app_data when not running and no proc_name
+    ios.proc_name = ""
+    ios.app_pid = lambda: _async_none()
+    ios.app_group_dirs = lambda: _async_list([])
+    assert await ios.clear_app_data() is True
+
+    # clear_app_data with app having helper daemons and bundle_dir
+    ios.package = "com.example.DemoServiceApp"
+    ios.proc_name = "DemoServiceApp"
+    ios.bundle_dir = lambda: _async_str("/Applications/DemoService.app")
+    demo_calls: list[str] = []
+    ios.run = lambda cmd, **kw: (demo_calls.append(cmd), _async_tuple((0, "ok")))[1]
+    assert await ios.clear_app_data() is True
+    assert any("pkill -9 -f /Applications/DemoService.app" in c for c in demo_calls)
+    assert any("pkill -9 -x demoservice" in c for c in demo_calls)
+    assert any("defaults delete com.example.demoservice" in c for c in demo_calls)
+
+    # clear_app_data for system app with no data container but bundle_dir found
+    ios.package = "com.example.sysapp"
+    ios.proc_name = "SysApp"
+    ios.data_dir = lambda: _async_str("")
+    ios.bundle_dir = lambda: _async_str("/Applications/SystemApp.app")
+    assert await ios.clear_app_data() is True
+
+    # clear_app_data when neither data_dir nor bundle_dir found
+    ios.bundle_dir = lambda: _async_str("")
+    assert await ios.clear_app_data() is False
+
+    ios.data_dir = lambda: _async_str("/var/mobile/Containers/Data/Application/XYZ")
+    ios.run = lambda cmd, **kw: _async_tuple((1, "permission denied"))
+    assert await ios.clear_app_data() is False
+    ios.package = ""
+    assert await ios.clear_app_data() is False
+
+    # all_data_dirs on iOS
+    assert await ios.all_data_dirs() == []
+    ios.package = "com.test.app"
+    ios.data_dir = lambda: _async_str("/var/mobile/Containers/Data/Application/P1")
+    ios.run = lambda cmd, **kw: _async_tuple((0, "Permission denied\n/var/mobile/Containers/Data/Application/P2/metadata.plist\n*invalid.plist\n"))
+    assert await ios.all_data_dirs() == [
+        "/var/mobile/Containers/Data/Application/P1",
+        "/var/mobile/Containers/Data/Application/P2",
+    ]
+
+    # all_data_dirs disambiguation with plutil -p when multiple containers match
+    multi_data = (
+        "/var/mobile/Containers/Data/Application/D1/.com.apple.mobile_container_manager.metadata.plist\n"
+        "/var/mobile/Containers/Data/Application/D2/.com.apple.mobile_container_manager.metadata.plist\n"
+    )
+    def fake_data_multi(cmd, **kw):
+        if "plutil -p" in cmd and "D1" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "com.test.app"\n}\n'))
+        if "plutil -p" in cmd and "D2" in cmd:
+            return _async_tuple((0, '{\n  "MCMMetadataIdentifier" => "com.test.apphelper"\n}\n'))
+        return _async_tuple((0, multi_data))
+    ios.data_dir = lambda: _async_str("")
+    ios.run = fake_data_multi  # type: ignore[assignment]
+    assert await ios.all_data_dirs() == ["/var/mobile/Containers/Data/Application/D1"]
+
+    # clear_app_data with com.apple.mobilesafari
+    ios.package = "com.apple.mobilesafari"
+    ios.proc_name = "MobileSafari"
+    ios.data_dir = lambda: _async_str("")
+    ios.bundle_dir = lambda: _async_str("/Applications/MobileSafari.app")
+    ios_calls_safari: list[str] = []
+    ios.run = lambda cmd, **kw: (ios_calls_safari.append(cmd), _async_tuple((0, "ok")))[1]
+    assert await ios.clear_app_data() is True
+    assert any("Safari" in c for c in ios_calls_safari)
+
+    # IosPanel server_bytes fallbacks
+    ios.jb = "/var/jb"
+    with patch.object(moabile.DevicePanel, "server_bytes", return_value=None):
+        ios.run = lambda c, **kw: _async_tuple((0, "123456")) if "wc -c < /usr/sbin" in c else _async_tuple((0, "ok"))
+        assert await ios.server_bytes() == 123456
+        assert ios._detected_server_path == "/usr/sbin/frida-server"
+
+    ios.jb = ""
+    with patch.object(moabile.DevicePanel, "server_bytes", return_value=None):
+        ios.run = lambda c, **kw: _async_tuple((0, "654321")) if "wc -c < /var/jb" in c else _async_tuple((0, "ok"))
+        assert await ios.server_bytes() == 654321
+        assert ios._detected_server_path == "/var/jb/usr/sbin/frida-server"
+    ios.jb = "/var/jb"
+
+    # IosPanel server_files without agent
+    inner_tar_noagent = io.BytesIO()
+    with tarfile.open(fileobj=inner_tar_noagent, mode="w") as tar:
+        info = tarfile.TarInfo("./var/jb/usr/sbin/frida-server")
+        info.size = 5
+        tar.addfile(info, io.BytesIO(b"12345"))
+    deb_noagent = moabile.CACHE / "frida_noagent_iphoneos-arm64.deb"
+    deb_noagent.write_bytes(b"!<arch>\n" + ar_member("data.tar", inner_tar_noagent.getvalue()))
+    ios.download = lambda *a, **kw: _async_bool(True)
+    assert await ios.server_files("noagent", "arm64") is None
+    deb_noagent.unlink(missing_ok=True)
+
+    # IosPanel master_up password prompts
+    ios.master = None
+    ios.master_said = False
+    ios.master_up = moabile.IosPanel.master_up.__get__(ios, moabile.IosPanel)
+    ios.tunnel_up = lambda: _async_bool(True)
+    ios.open_master = lambda pw: _async_str("Permission denied") if not pw else _async_str("Wrong password")
+    ios.mob.push_screen_wait = lambda s: _async_str("")
+    assert await ios.master_up() is False
+    assert ios.master_said is True
+
+    ios.master_said = False
+    ios.mob.push_screen_wait = lambda s: _async_str("wrong_pw")
+    assert await ios.master_up() is False
+    assert ios.master_said is True
+    ios.master_said = False
+
+    # IosPanel master_up connection error & OpenSSH guidance
+    assert moabile.IosPanel.is_connection_error(
+        "connect to host 127.0.0.1 port 2222: Connection refused"
+    ) is True
+    assert moabile.IosPanel.is_connection_error("Permission denied") is False
+    ios.open_master = lambda pw: _async_str("ssh: connect to host 127.0.0.1 port 2222: Connection refused")
+    assert await ios.master_up() is False
+    assert any("To enable SSH on jailbroken iOS" in t for t in ios.log_history)
+    ios.master_said = False
+
+    ios.open_master = lambda pw: _async_str("Permission denied") if pw == "alpine" else _async_str(
+        "Connection reset by peer"
+    )
+    ios.mob.push_screen_wait = lambda s: _async_str("wrong_pw")
+    assert await ios.master_up() is False
+    assert ios.master_said is True
+    ios.master_said = False
+
+    # IosPanel tunnel_up timeout
+    ios.tunnel_up = moabile.IosPanel.tunnel_up.__get__(ios, moabile.IosPanel)
+    orig_ticks = moabile.TUNNEL_TICKS
+    moabile.TUNNEL_TICKS = 1
+    fake_tunnel = type("Proc", (), {
+        "pid": 12345,
+        "poll": lambda s: None,
+        "terminate": lambda s: None,
+        "wait": lambda s, timeout=None: None,
+        "kill": lambda s: None,
+    })()
+    ios.tunnel = None
+    orig_popen = subprocess.Popen
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        if args and isinstance(args[0], (list, tuple)) and args[0] and "iproxy" in str(args[0][0]):
+            return fake_tunnel
+        return orig_popen(*args, **kwargs)
+
+    moabile._HELP[("iproxy", "--udid")] = True
+    with patch("subprocess.Popen", side_effect=fake_popen), \
+         patch("moabile.port_listening", return_value=False):
+        assert await ios.tunnel_up() is False
+    moabile.TUNNEL_TICKS = orig_ticks
+    ios.tunnel = None
+
+    # unpack_deb with symlink member (source is None)
+    sym_inner = io.BytesIO()
+    with tarfile.open(fileobj=sym_inner, mode="w") as tar:
+        sym = tarfile.TarInfo("var/jb/symlink")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "target"
+        tar.addfile(sym)
+    sym_deb = Path(TMP) / "sym.deb"
+    sym_deb.write_bytes(b"!<arch>\n" + ar_member("data.tar", sym_inner.getvalue()))
+    assert moabile.unpack_deb(sym_deb, Path(TMP) / "sym_out") == []
+    sym_deb.unlink(missing_ok=True)
+    shutil.rmtree(Path(TMP) / "sym_out", ignore_errors=True)
+
+    # TerminalPane on_click, _pause_on_exit, and key c
+    tp = moabile.TerminalPane(dp)
+    tp.proc = type("Proc", (), {"pid": 1234, "poll": lambda s: None, "wait": lambda s, timeout=None: None})()
+    tp.action_copy_terminal = lambda: setattr(tp, "_copied", True)
+    click_evt = events.Click(None, 0, 0, 0, 0, 1, False, False, False)
+    tp.on_click(click_evt)
+    assert getattr(tp, "_copied", False) is True
+
+    tp._pause_on_exit(1)
+    assert tp.exited == 1
+    key_c = events.Key("c", "c")
+    with patch.object(moabile.TerminalPane, "app", app_cli), \
+         patch.object(app_cli, "push_screen"):
+        tp.on_key(key_c)
+
+    # MOABile copy_to_clipboard and _clipboard_via
+    app_cli._clipboard_via(["cat"], "clipboard text")
+    with patch("sys.platform", "darwin"), patch.object(app_cli, "run_worker") as rw:
+        app_cli.copy_to_clipboard("mac text")
+        assert rw.called
+    with patch("sys.platform", "linux"), patch("shutil.which", side_effect=lambda x: "/bin/wl-copy" if x == "wl-copy" else None), patch.object(app_cli, "run_worker") as rw:
+        app_cli.copy_to_clipboard("wl text")
+        assert rw.called
+    with patch("sys.platform", "linux"), patch("shutil.which", side_effect=lambda x: "/bin/xclip" if x == "xclip" else None), patch.object(app_cli, "run_worker") as rw:
+        app_cli.copy_to_clipboard("xclip text")
+        assert rw.called
+    with patch("sys.platform", "linux"), patch("shutil.which", side_effect=lambda x: "/bin/xsel" if x == "xsel" else None), patch.object(app_cli, "run_worker") as rw:
+        app_cli.copy_to_clipboard("xsel text")
+        assert rw.called
+
+    # log_history truncation and _flush keyword styling
+    dp.log_history.clear()
+    for i in range(10005):
+        dp.write(f"line {i}")
+    assert len(dp.log_history) == 10000
+    assert dp.log_history[0] == "line 5"
+
+    dp.log_filter = "target"
+    dp._flush(["first target line", "no match", "multi target and target again"])
+    dp.log_filter = ""
+
+    # push with can_stage = False and mkdir -p
+    dp.push = moabile.DevicePanel.push.__get__(dp, moabile.DevicePanel)
+    copy_calls = 0
+
+    async def fake_push_copy(l: str, r: str) -> tuple[int, str]:
+        nonlocal copy_calls
+        copy_calls += 1
+        return (1, "denied") if copy_calls == 1 else (0, "ok")
+
+    dp.copy_in = fake_push_copy
+    dp.run = lambda c, **kw: _async_tuple((0, "ok"))
+    with patch.object(StubPanel, "can_stage", False):
+        assert (await dp.push("/tmp/local", "/remote/dir/file"))[0] == 0
+    assert copy_calls == 2
+
+    # AndroidPanel.cat_out timeout & OSError
+    proc_mock = type("Proc", (), {
+        "pid": 1234,
+        "communicate": lambda s: _async_tuple((b"", b"")),
+        "wait": lambda s: _async_none(),
+        "returncode": 0,
+    })()
+
+    async def fake_timeout_wait(fut: object, timeout: object = None) -> None:
+        if asyncio.iscoroutine(fut):
+            fut.close()
+        raise asyncio.TimeoutError()
+
+    with patch("asyncio.create_subprocess_exec", return_value=proc_mock), \
+         patch("asyncio.wait_for", side_effect=fake_timeout_wait), \
+         patch("os.getpgid", return_value=1234), \
+         patch("os.killpg"):
+        rc, err = await ap.cat_out("/remote/test", str(TMP / "dest"))
+        assert rc == 1 and "timed out" in err
+
+    rc, err = await ap.cat_out("/remote/test", "/nonexistent_dir/impossible/dest")
+    assert rc == 1
+
+    # MOABile action_clear_app_data branches
+    app_cli.target = lambda: None
+    await moabile.MOABile.action_clear_app_data.__wrapped__(app_cli)
+
+    app_cli.target = lambda: dp
+    dp.serial = "emulator-5554"
+    dp.package = ""
+    await moabile.MOABile.action_clear_app_data.__wrapped__(app_cli)
+
+    dp.package = "com.test"
+    app_cli.push_screen_wait = lambda s: _async_bool(False)
+    await moabile.MOABile.action_clear_app_data.__wrapped__(app_cli)
+
+    app_cli.push_screen_wait = lambda s: _async_bool(True)
+    await moabile.MOABile.action_clear_app_data.__wrapped__(app_cli)
+    dp.package = ""
+
+    # MOABile action_frida_purge standalone branches
+    app_cli.target = lambda: None
+    fake_v_purge = moabile.client_venv_dir("44.44.44")
+    fake_v_purge.mkdir(parents=True, exist_ok=True)
+    app_cli.push_screen_wait = lambda s: _async_bool(False)
+    await moabile.MOABile.action_frida_purge.__wrapped__(app_cli)
+    assert fake_v_purge.exists()
+
+    app_cli.push_screen_wait = lambda s: _async_bool(True)
+    await moabile.MOABile.action_frida_purge.__wrapped__(app_cli)
+    assert not fake_v_purge.exists()
+
+    # MOABile action_copy_terminal and action_leave_terminal
+    tp_test = moabile.TerminalPane(dp)
+    tp_test.action_leave = lambda: setattr(tp_test, "_left", True)
+    tp_test.action_copy_terminal = lambda: setattr(tp_test, "_copied", True)
+    with patch.object(moabile.MOABile, "focused", tp_test):
+        app_cli.action_copy_terminal()
+        app_cli.action_leave_terminal()
+    assert getattr(tp_test, "_left", False) is True
+    assert getattr(tp_test, "_copied", False) is True
+
+    # MOABile action_frida_client & action_objection without package
+    app_cli.target = lambda: dp
+    dp.package = ""
+    await moabile.MOABile.action_frida_client.__wrapped__(app_cli)
+    await moabile.MOABile.action_objection.__wrapped__(app_cli)
+
+    # MOABile action_install confirm cancel
+    orig_push = app_cli.push_screen_wait
+
+    async def fake_install_screens(scr: object) -> object:
+        if isinstance(scr, moabile.ScriptScreen):
+            return "/tmp/fake.apk"
+        if isinstance(scr, moabile.ConfirmScreen):
+            return False
+        return None
+
+    app_cli.push_screen_wait = fake_install_screens
+    await moabile.MOABile.action_install.__wrapped__(app_cli)
+    app_cli.push_screen_wait = orig_push
+
+    # unpack_deb extractfile returning None
+    deb_none_member = io.BytesIO()
+    with tarfile.open(fileobj=deb_none_member, mode="w") as tar:
+        ti = tarfile.TarInfo("var/jb/dummy")
+        ti.size = 5
+        tar.addfile(ti, io.BytesIO(b"12345"))
+    deb_none = Path(TMP) / "deb_none.deb"
+    deb_none.write_bytes(b"!<arch>\n" + ar_member("data.tar", deb_none_member.getvalue()))
+    with patch("tarfile.TarFile.extractfile", return_value=None):
+        assert moabile.unpack_deb(deb_none, Path(TMP) / "none_out") == []
+    deb_none.unlink(missing_ok=True)
+    shutil.rmtree(Path(TMP) / "none_out", ignore_errors=True)
+
+    # TerminalPane._readable when not data and proc still running
+    tp_read = moabile.TerminalPane(dp)
+    tp_read.proc = type("Proc", (), {
+        "pid": 1234,
+        "poll": lambda s: None,
+        "wait": lambda s, timeout=None: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["c"], 0.1)),
+    })()
+    tp_read.fd = None
+    with patch("moabile.reap"):
+        tp_read._readable()
+
+    # spawn_on_pty child preexec_fn coverage
+    def fake_popen_exec_child(*a: object, **kw: object) -> object:
+        if "preexec_fn" in kw and callable(kw["preexec_fn"]):
+            with patch("os.setsid"), patch.object(moabile.fcntl, "ioctl"):
+                kw["preexec_fn"]()
+        return type("Proc", (), {"pid": 1111})()
+
+    with patch("subprocess.Popen", side_effect=fake_popen_exec_child), \
+         contextlib.suppress(Exception):
+        moabile.spawn_on_pty(["echo"])
+
+    # HostList entry_selected with non-ValueItem or empty
+    hl_bad = moabile.HostList("/tmp")
+    evt_bad = type("Evt", (), {"item": moabile.ListItem(), "stop": lambda s: None})()
+    hl_bad.entry_selected(evt_bad)
+
+    # HostList listing with is_dir raising OSError
+    bad_entry = type("Entry", (), {
+        "is_dir": lambda s: (_ for _ in ()).throw(OSError("stale")),
+        "name": "bad_entry",
+    })()
+    with patch("os.scandir") as mock_scan:
+        mock_scan.return_value.__enter__.return_value = [bad_entry]
+        rc, out = await hl_bad.listing()
+        assert rc == 0
+
+    # FilesScreen.focused_side with non-FileList focus
+    fs_test = moabile.FilesScreen(dp)
+    fs_test._app = app_cli
+    fs_test.notify = lambda *a, **kw: None
+    with patch.object(moabile.FilesScreen, "focused", new_callable=PropertyMock, return_value=None):
+        assert fs_test.focused_side() is None
+
+    # FilesScreen.action_app_dir when data_dir is empty
+    dp.package = "com.test"
+    dp.data_dir = lambda: _async_str("")
+    await fs_test.action_app_dir.__wrapped__(fs_test)
+    dp.package = ""
+
+    # FilesScreen.file_at_cursor when nothing is highlighted
+    with patch.object(fs_test, "focused_side", return_value=fs_test.host), \
+         patch.object(fs_test.host, "highlighted", return_value=""):
+        assert fs_test.file_at_cursor() is None
+
+    # FilesScreen.action_rename with empty or unchanged name
+    app_cli.push_screen_wait = lambda s: _async_str("file.txt")
+    with patch.object(fs_test, "file_at_cursor", return_value=(fs_test.host, "/tmp/file.txt")):
+        await fs_test.action_rename.__wrapped__(fs_test)
+
+    # FilesScreen.action_rename when target is an existing directory
+    app_cli.push_screen_wait = lambda s: _async_str("somedir")
+    with patch.object(fs_test, "file_at_cursor", return_value=(fs_test.host, "/tmp/file.txt")), \
+         patch.object(fs_test.host, "is_dir", return_value=True):
+        await fs_test.action_rename.__wrapped__(fs_test)
+
+    # FilesScreen.report with rc != 0
+    fs_test.report(1, "error occurred")
+
+    # ScriptScreen and CodeshareScreen reload actions
+    ss_test = moabile.ScriptScreen("/tmp")
+    ss_test.side.reload = lambda: None
+    ss_test.action_reload()
+    cs_test = moabile.CodeshareScreen()
+    cs_test.load = lambda: None
+    cs_test.action_reload()
+    assert cs_test.found_for is None
+
+    # DevicePanel.refresh_stats detached during stats
+    class DetachPanel(StubPanel):
+        @property
+        def is_attached(self) -> bool:
+            return not getattr(self, "_detached", False)
+
+    dp_detach = DetachPanel("detach_test", app_cli)
+
+    async def fake_stats_detach() -> dict[str, str]:
+        dp_detach._detached = True
+        return {}
+
+    dp_detach._detached = False
+    dp_detach.stats = fake_stats_detach
+    await dp_detach.refresh_stats()
+
+    # DevicePanel.ensure_frida empty custom version or existing frida_version
+    dp.frida_pid = lambda: _async_none()
+    dp.server_bytes = lambda: _async_none()
+    dp.mob.push_screen_wait = lambda scr: (
+        _async_str("") if isinstance(scr, moabile.AskScreen) else _async_str("c")
+    )
+    assert await dp.ensure_frida() is False
+
+    dp.server_files = lambda v, a: _async_none()
+    assert await dp.ensure_frida(custom_ver="16.1.0") is False
+
+    # DevicePanel.launch_server with long error output
+    dp.frida_pid = lambda: _async_none()
+    dp.run = lambda c, **kw: _async_tuple((0, "err_" * 40))
+
+    async def fake_sleep(*a: object, **kw: object) -> None:
+        pass
+
+    with patch("asyncio.sleep", side_effect=fake_sleep):
+        assert await dp.launch_server("frida-server") is False
+
+    # DevicePanel._stream with OSError
+    with patch("asyncio.create_subprocess_exec", side_effect=OSError("stream failed")):
+        await dp._stream.__wrapped__(dp, "bad_name", ("bad_exec",))
+
+    # IosPanel edge cases with fresh panel
+    ios_test: Any = moabile.IosPanel("00008030001122334455667788AABBCC", cast(moabile.MOABile, FakeApp()))
+
+    # IosPanel.master_up tunnel failure and master_said recheck
+    with patch.object(ios_test, "tunnel_up", return_value=False):
+        assert await ios_test.master_up() is False
+    with patch.object(ios_test, "tunnel_up", return_value=True):
+        ios_test.master = None
+        ios_test.master_said = True
+        assert await ios_test.master_up() is False
+        ios_test.master_said = False
+
+    # IosPanel.open_master spawn_on_pty OSError and prompt denial
+    with patch("moabile.spawn_on_pty", side_effect=OSError("pty failed")):
+        res_err = await ios_test.open_master("alpine")
+        assert "ssh: pty failed" in res_err
+
+    # IosPanel.open_master repeated prompt / password refused (asked > 1)
+    orig_master_ticks = moabile.SSH_MASTER_TICKS
+    moabile.SSH_MASTER_TICKS = 5
+    fake_pty_proc = type("Proc", (), {
+        "pid": 1234,
+        "poll": lambda s: None,
+        "wait": lambda s, timeout=None: 0,
+    })()
+    ticks_count = 0
+
+    def fake_echo_off(fd: int) -> bool:
+        nonlocal ticks_count
+        ticks_count += 1
+        return ticks_count in (1, 3)
+
+    p_pty, s_pty = moabile.pty.openpty()
+    os.close(s_pty)
+    with patch("moabile.spawn_on_pty", return_value=(fake_pty_proc, p_pty)), \
+         patch("moabile.echo_off", side_effect=fake_echo_off), \
+         patch("moabile.reap"):
+        res_refused = await ios_test.open_master("alpine")
+        assert res_refused in ("***", "the password was refused")
+    moabile.SSH_MASTER_TICKS = orig_master_ticks
+
+    # IosPanel.open_master denied without prompt
+    fake_denied_proc = type("Proc", (), {
+        "pid": 1234,
+        "poll": lambda s: 1,
+        "wait": lambda s, timeout=None: 1,
+    })()
+    p_pty2, s_pty2 = moabile.pty.openpty()
+    os.write(s_pty2, b"Permission denied (publickey,password).\n")
+    os.close(s_pty2)
+    with patch("moabile.spawn_on_pty", return_value=(fake_denied_proc, p_pty2)), \
+         patch("moabile.reap"):
+        res_denied = await ios_test.open_master("alpine")
+        assert "sshd on the phone allows no password" in res_denied
+
+    # IosPanel.tunnel_up pick_port failure and OSError
+    with patch.object(ios_test, "pick_port", return_value=False):
+        assert await ios_test.tunnel_up() is False
+    with patch.object(ios_test, "pick_port", return_value=True), \
+         patch("subprocess.Popen", side_effect=OSError("iproxy error")):
+        assert await ios_test.tunnel_up() is False
+
+    # IosPanel.tunnel_up tunnel replaced while waiting
+    orig_ticks = moabile.TUNNEL_TICKS
+    moabile.TUNNEL_TICKS = 1
+    fake_tunnel_proc = type("Proc", (), {"pid": 1234, "poll": lambda s: None})()
+    with patch.object(ios_test, "pick_port", return_value=True), \
+         patch("subprocess.Popen", return_value=fake_tunnel_proc), \
+         patch("moabile.port_listening", return_value=False):
+        async def reset_tunnel() -> None:
+            await asyncio.sleep(0.02)
+            ios_test.tunnel = None
+        t1 = asyncio.create_task(ios_test.tunnel_up())
+        t2 = asyncio.create_task(reset_tunnel())
+        await asyncio.gather(t1, t2)
+    moabile.TUNNEL_TICKS = orig_ticks
+    ios_test.tunnel = None
+
+    # IosPanel.master_up second check on self.master_said under lock
+    ios_test.master = None
+    ios_test.master_said = False
+
+    async def lock_and_set() -> None:
+        async with ios_test.master_lock:
+            await asyncio.sleep(0.02)
+            ios_test.master_said = True
+
+    t_lock = asyncio.create_task(lock_and_set())
+    await asyncio.sleep(0.005)
+    with patch.object(ios_test, "tunnel_up", new=lambda: _async_bool(True)):
+        assert await ios_test.master_up() is False
+    await t_lock
+    ios_test.master_said = False
+
+    # IosPanel.as_root & launch with ssh_user == "root"
+    ios_test.ssh_user = "root"
+    ios_test.package = "com.root.app"
+    cmd_r, inp_r = ios_test.as_root("ls")
+    assert cmd_r == moabile.IOS_PATH + "ls" and inp_r == b""
+    ios_test.run = lambda c, **kw: _async_tuple((1, "open failed"))
+    assert await ios_test.launch_app() is False
+
+    # MOABile.tick & poll with refresh_stats raising Exception
+    with patch.object(app_cli, "poll") as mock_p:
+        app_cli.tick()
+        assert mock_p.called
+
+    app_cli._ticking = True
+    await app_cli.poll.__wrapped__(app_cli)
+    app_cli._ticking = False
+
+    with patch.object(moabile.MOABile, "panels", new_callable=PropertyMock, return_value=[dp]), \
+         patch.object(dp, "refresh_stats", side_effect=RuntimeError("stats error")), \
+         patch.object(app_cli, "refresh_devices", new=lambda: _async_none()):
+        await app_cli.poll.__wrapped__(app_cli)
+
+    # MOABile.action_rescan while _ticking is True
+    app_cli._ticking = True
+
+    async def untick_later() -> None:
+        await asyncio.sleep(0.08)
+        app_cli._ticking = False
+
+    asyncio.create_task(untick_later())
+    ios_rescan = moabile.IosPanel("00008030-0011223344556677", cast(moabile.MOABile, FakeApp()))
+    ios_rescan.root = False
+    ios_rescan.master_said = True
+    desc_called = False
+
+    async def fake_desc() -> None:
+        nonlocal desc_called
+        desc_called = True
+
+    ios_rescan.describe = fake_desc  # type: ignore[assignment]
+    with patch.object(app_cli, "refresh_devices", new=lambda: _async_none()), \
+         patch.object(moabile.MOABile, "panels", new_callable=PropertyMock, return_value=[dp, ios_rescan]), \
+         patch.object(dp, "load_packages", new=lambda: _async_none()), \
+         patch.object(ios_rescan, "load_packages", new=lambda: _async_none()), \
+         patch.object(app_cli, "sync_sidebar"):
+        await app_cli.action_rescan.__wrapped__(app_cli)
+    assert desc_called is True
+    assert ios_rescan.master_said is False
+
+    # MOABile.open_or_close while serial already in _toggling
+    app_cli._toggling.add("test-serial-123")
+    await app_cli.open_or_close.__wrapped__(app_cli, "test-serial-123")
+    app_cli._toggling.discard("test-serial-123")
+
+    # MOABile.choose_package with no target panel
+    with patch.object(app_cli, "target", return_value=None):
+        await app_cli.choose_package.__wrapped__(app_cli, "com.test")
+
+    # MOABile.action_frida_client when ensure_frida returns False
+    dp.package = "com.test"
+    app_cli.push_screen_wait = lambda s: _async_str("")
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(dp, "app_pid", return_value=None), \
+         patch.object(dp, "ensure_frida", return_value=False):
+        await app_cli.action_frida_client.__wrapped__(app_cli)
+
+    # MOABile.action_objection ensure_frida failure and launch timeout
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(dp, "ensure_frida", return_value=False):
+        dp.package = "com.test"
+        await app_cli.action_objection.__wrapped__(app_cli)
+
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(dp, "ensure_frida", return_value=True), \
+         patch.object(dp, "app_pid", return_value=None), \
+         patch.object(dp, "launch_app", return_value=True), \
+         patch("asyncio.sleep", side_effect=fake_sleep):
+        dp.package = "com.test"
+        await app_cli.action_objection.__wrapped__(app_cli)
+    dp.package = ""
+
+    # MOABile.action_mirror missing tool and OSError on Popen
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(moabile.MOABile, "panels", new_callable=PropertyMock, return_value=[dp]), \
+         patch("shutil.which", return_value=None):
+        dp.mirror = None
+        app_cli.action_mirror()
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(moabile.MOABile, "panels", new_callable=PropertyMock, return_value=[dp]), \
+         patch("shutil.which", return_value="/bin/scrcpy"), \
+         patch("subprocess.Popen", side_effect=OSError("popen error")):
+        dp.mirror = None
+        app_cli.action_mirror()
+    mock_popen = MagicMock(pid=999)
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch.object(moabile.MOABile, "panels", new_callable=PropertyMock, return_value=[dp]), \
+         patch("shutil.which", return_value="/bin/scrcpy"), \
+         patch("subprocess.Popen", return_value=mock_popen):
+        dp.mirror = None
+        app_cli.action_mirror()
+        assert dp.mirror == mock_popen
+
+    # _mirror_worker failure path and dead process path
+    with patch.object(dp, "mirror_ready", return_value=(False, "server tweak not found")):
+        dp.mirror = None
+        await app_cli._mirror_worker(dp)
+        assert dp.mirror is None
+
+    mock_dead = MagicMock(pid=998)
+    mock_dead.poll.return_value = 1
+    mock_dead.returncode = 1
+    with patch.object(dp, "mirror_ready", return_value=(True, "")), \
+         patch.object(app_cli, "_spawn_mirror", side_effect=lambda p: setattr(p, "mirror", mock_dead) or True):
+        await app_cli._mirror_worker(dp)
+        assert dp.mirror is None
+
+    # _spawn_mirror OSError on open log_path
+    with patch("builtins.open", side_effect=OSError("disk error")), \
+         patch("subprocess.Popen", return_value=MagicMock()):
+        assert app_cli._spawn_mirror(dp) is True
+
+    # _spawn_mirror OSError and failure in worker
+    with patch("subprocess.Popen", side_effect=OSError("spawn failed")):
+        assert app_cli._spawn_mirror(dp) is False
+    with patch.object(dp, "mirror_ready", return_value=(True, "")), \
+         patch.object(app_cli, "_spawn_mirror", return_value=False):
+        await app_cli._mirror_worker(dp)
+
+    # _mirror_worker with dead process and error log
+    mock_log = MagicMock()
+    mock_log.read.return_value = b"handshake failed: refused\n"
+    dp._mirror_log = mock_log
+    with patch.object(dp, "mirror_ready", return_value=(True, "")), \
+         patch.object(app_cli, "_spawn_mirror", side_effect=lambda p: setattr(p, "mirror", mock_dead) or True):
+        await app_cli._mirror_worker(dp)
+        assert dp.mirror is None
+
+    # action_mirror closing with _mirror_log open
+    dp.mirror = MagicMock()
+    dp.mirror.poll.return_value = None
+    dp._mirror_log = MagicMock()
+    with patch.object(app_cli, "target", return_value=dp), \
+         patch("moabile.reap") as mock_reap:
+        app_cli.action_mirror()
+        assert dp.mirror is None
+        assert dp._mirror_log is None
+        assert mock_reap.called
+
+    # IosPanel.mirror_ready when master is down
+    ios_panel = moabile.IosPanel("dummy-udid", app_cli)
+    with patch.object(ios_panel, "master_up", return_value=False):
+        ready, _ = await ios_panel.mirror_ready()
+        assert ready is True
+
+    # _mirror_worker with ioscpy dead process to cover hint
+    with patch.object(ios_panel, "mirror_ready", return_value=(True, "")), \
+         patch.object(app_cli, "_spawn_mirror", side_effect=lambda p: setattr(p, "mirror", mock_dead) or True):
+        await app_cli._mirror_worker(ios_panel)
+        assert ios_panel.mirror is None
+
+    # MOABile.action_text_viewer with running terminal, last terminal output, and empty
+    tp_live = moabile.TerminalPane(dp)
+    tp_live.exited = 0
+    tp_live.command = "sh"
+    tp_live.vt = object()
+    tp_live.get_history_text = lambda: "history line 1\nhistory line 2"
+    orig_query_one = dp.query_one
+    dp.query_one = lambda cls: tp_live if cls is moabile.TerminalPane else orig_query_one(cls)
+    dp.log_history = ["log line 1"]
+    psw_calls = 0
+
+    async def track_psw(s: object) -> object:
+        nonlocal psw_calls
+        psw_calls += 1
+        return None
+
+    app_cli.push_screen_wait = track_psw
+    with patch.object(app_cli, "target", return_value=dp):
+        await app_cli.action_text_viewer.__wrapped__(app_cli)
+        assert psw_calls == 1
+
+    dp.log_history = []
+    dp.last_terminal_output = "previous session log"
+    tp_live.exited = None
+    tp_live.proc = None
+    with patch.object(app_cli, "target", return_value=dp):
+        await app_cli.action_text_viewer.__wrapped__(app_cli)
+        assert psw_calls == 2
+
+    dp.last_terminal_output = None
+    with patch.object(app_cli, "target", return_value=dp):
+        await app_cli.action_text_viewer.__wrapped__(app_cli)
+        assert psw_calls == 3
+    dp.query_one = orig_query_one
+
+    # MOABile.action_save_app with no target
+    with patch.object(app_cli, "target", return_value=None):
+        await app_cli.action_save_app.__wrapped__(app_cli)
+
+    # MOABile.action_quit with panels shutting down
+    p_quit_mock = StubPanel("quit-mock", app_cli)
+    p_quit_mock.query_one = lambda cls: tp_live  # type: ignore[assignment]
+    p_quit_mock.shutdown = lambda: _async_none()  # type: ignore[assignment]
+    app_cli.push_screen_wait = lambda s: _async_bool(True)
+    with patch.object(moabile.MOABile, "panels", new_callable=lambda: property(lambda s: [p_quit_mock])), \
+         patch.object(app_cli, "exit"):
+        await app_cli.action_quit.__wrapped__(app_cli)
+
+    # moabile.main([]) with mocked MOABile.run
+    with patch.object(moabile.MOABile, "run", return_value=0):
+        assert moabile.main([]) == 0
+
+    # safe_killpg guards
+    with patch("os.killpg") as mock_k, patch("os.kill") as mock_kill:
+        moabile.safe_killpg(MagicMock(), signal.SIGTERM)
+        moabile.safe_killpg(1, signal.SIGTERM)
+        moabile.safe_killpg(0, signal.SIGTERM)
+        moabile.safe_killpg(-5, signal.SIGTERM)
+        moabile.safe_killpg(True, signal.SIGTERM)
+        moabile.safe_killpg(None, signal.SIGTERM)
+        assert not mock_k.called and not mock_kill.called
+        with patch("os.getpgid", return_value=os.getpgrp()):
+            moabile.safe_killpg(9999, signal.SIGTERM)
+            assert not mock_k.called and mock_kill.called
+        mock_kill.reset_mock()
+        with patch("os.getpgid", return_value=8888):
+            moabile.safe_killpg(9999, signal.SIGTERM)
+            assert mock_k.called and not mock_kill.called
+
+    # reap on MagicMock or None
+    with patch("os.killpg") as mock_k:
+        moabile.reap(None)
+        m_proc = MagicMock()
+        m_proc.poll.return_value = None
+        moabile.reap(m_proc)
+        assert not mock_k.called
+
+    active_app.reset(active_token)
     print("PASS edge cases: error paths, base classes, and process boundaries")
 
 
@@ -1662,6 +2911,31 @@ async def phase_keys(app, pilot) -> None:
     app.deliver_screenshot = lambda *a, **kw: delivered.append(a)
     await pilot.press("v")
     assert await settle(pilot, lambda: bool(delivered), tries=120), "v took no screenshot"
+
+    # _on_delivery_complete handles screenshot notifications cleanly without markup leaks
+    orig_notify = app.notify
+    try:
+        notifications: list[str] = []
+        app.notify = lambda msg, **kw: notifications.append(str(msg))  # type: ignore[assignment]
+        ev_none = moabile.events.DeliveryComplete(key="k1", path=None, name="screenshot")
+        app._on_delivery_complete(ev_none)
+        assert ev_none._no_default_action is True
+        assert ev_none._stop_propagation is True
+        assert notifications == ["Saved screenshot"]
+
+        ev_path = moabile.events.DeliveryComplete(
+            key="k2", path=Path("/tmp/shot.svg"), name="screenshot"
+        )
+        app._on_delivery_complete(ev_path)
+        assert ev_path._no_default_action is True
+        assert ev_path._stop_propagation is True
+        assert notifications[-1] == "Saved screenshot to /tmp/shot.svg"
+
+        ev_other = moabile.events.DeliveryComplete(key="k3", path=None, name="other")
+        app._on_delivery_complete(ev_other)
+        assert len(notifications) == 2
+    finally:
+        app.notify = orig_notify
     print("PASS keys, screenshot and theme each have a key of their own")
 
     # Boxes are a share of the screen with a ceiling, so a narrow terminal
@@ -2968,6 +4242,7 @@ async def phase_ios(app, pilot) -> None:
     # sysctl, vm_stat and ifconfig live under /usr/sbin and /var/jb, which a
     # non-interactive ssh does not always have on its PATH — and when they are
     # not found the line said ? three times with nothing to say why.
+    app._ticking = True
     (TMP / "ssh-log").write_text("")
     await ios.stats()
     assert "/var/jb/usr/sbin" in (TMP / "ssh-log").read_text(), "no PATH for the phone's tools"
@@ -3425,6 +4700,14 @@ async def phase_ios(app, pilot) -> None:
     (TMP / "ios-nogrep").unlink()
     print("PASS a phone with no grep says so, rather than reading as an app that is gone")
 
+    (TMP / "ios-no-ioscpy").touch()
+    app.action_mirror()
+    assert await settle(pilot, lambda: "server tweak not found" in log_text(ios)), log_text(ios)
+    assert "https://lautarovculic.github.io/ioscpy-repo/" in log_text(ios), log_text(ios)
+    assert ios.mirror is None
+    (TMP / "ios-no-ioscpy").unlink()
+    print("PASS w warns and guides when ioscpy server tweak is not installed on the phone")
+
     app.action_mirror()
     assert await settle(pilot, lambda: ios.mirror is not None), log_text(ios)
     window = ios.mirror
@@ -3496,7 +4779,7 @@ async def phase_ios(app, pilot) -> None:
     (TMP / "ssh-log").write_text("")
     assert (await ios.app_pid()) == "4321", await ios.app_pid()
     assert ios.proc_name == "Target", ios.proc_name
-    assert "grep -ls" not in (TMP / "ssh-log").read_text(), "the phone was searched anyway"
+    assert "grep -als" not in (TMP / "ssh-log").read_text(), "the phone was searched anyway"
     # The search is the fallback for an installer too old to be asked for the
     # attribute, and then it happens once per app picked, not once per call:
     # objection asks ten times while it waits for the app to come up.
@@ -3506,9 +4789,9 @@ async def phase_ios(app, pilot) -> None:
     (TMP / "ssh-log").write_text("")
     assert (await ios.app_pid()) == "4321", await ios.app_pid()
     assert ios.proc_name == "Target", ios.proc_name
-    assert (TMP / "ssh-log").read_text().count("grep -ls") == 1, (TMP / "ssh-log").read_text()
+    assert (TMP / "ssh-log").read_text().count("grep -als") == 1, (TMP / "ssh-log").read_text()
     await ios.app_pid()
-    assert (TMP / "ssh-log").read_text().count("grep -ls") == 1, "the bundle was looked up twice"
+    assert (TMP / "ssh-log").read_text().count("grep -als") == 1, "the bundle was looked up twice"
     ios.executables, ios.bundles = kept, keptb
     print("PASS a stopped app is started with open(1) and found in the process table")
 
@@ -4052,6 +5335,25 @@ async def phase_edge_cases(app, pilot) -> None:
     app.action_mirror()
     panel.mirror_tool = old_tool
 
+    # CodeshareScreen fetch error paths
+    cs_err = moabile.CodeshareScreen(needle="fail_query")
+    cs_err_where = MagicMock()
+    with patch.object(cs_err, "query_one", side_effect=lambda sel, *a: cs_err_where if "#where" in sel else MagicMock()), \
+         patch("moabile.sh", return_value=(7, "connection failed")):
+        assert await cs_err.fetch() is None
+
+    cs_err_browse = moabile.CodeshareScreen()
+    cs_err_browse.site_pages = 5
+    with patch.object(cs_err_browse, "query_one", side_effect=lambda sel, *a: cs_err_where if "#where" in sel else MagicMock()), \
+         patch("moabile.sh", return_value=(7, "connection failed")):
+        assert await cs_err_browse.fetch() is None
+
+    # stream tail exceeding MAX_LINE_BYTES without newline
+    panel.start_stream("test_cut", "python3", "-c",
+                       "import sys, time; sys.stdout.write('x' * 1000010); sys.stdout.flush(); time.sleep(0.3)")
+    await asyncio.sleep(0.2)
+    panel.stop_stream("test_cut")
+
 
 async def main() -> None:
     # A helper named run() would shadow App.run() and the TUI would never start.
@@ -4148,7 +5450,7 @@ async def main() -> None:
                 assert hasattr(cls_screen, f"action_{binding.action}"), (cls_screen.__name__, binding.action)
     app_bindings = [b for b in moabile.MOABile.BINDINGS if isinstance(b, moabile.Binding)]
     assert {b.key for b in app_bindings} == {
-        "r", "b", "f", "s", "o", "w", "t", "l", "slash", "c", "alt+c", "f8", "d", "a", "e", "i", "u", "p", "k", "v",
+        "r", "b", "f", "s", "o", "w", "t", "l", "slash", "c", "alt+c", "f8", "d", "a", "e", "x", "i", "u", "p", "k", "v",
         "m", "h", "q"}
     # A key that stands for nothing in the word beside it has to be memorised
     # twice, so the bar is built the other way round: the label is chosen to
@@ -4158,7 +5460,7 @@ async def main() -> None:
            if not b.description.startswith(b.key)]
     assert off == [
         ("b", "sidebar"), ("slash", "log filter"), ("alt+c", "copy terminal"),
-        ("f8", "leave terminal"), ("d", "files"), ("k", "clear"), ("v", "svg"),
+        ("f8", "leave terminal"), ("d", "files"), ("x", "wipe"), ("k", "clear"), ("v", "svg"),
     ], off
     # The bar has room for a word each, so the whole sentence lives in the
     # tooltip — which is what hovering a key and the h panel show.
@@ -4379,9 +5681,11 @@ async def main() -> None:
     assert moabile.port_free(moabile.IOS_SSH_PORT), "a usb tunnel outlived the app"
     print("PASS nothing the app started is left running when the app is gone")
 
-asyncio.run(main())
-# Only on the way out clean: a run that failed leaves its fake tools, logs and
-# staged files where they can be looked at, and a run that passed leaves the
-# machine as it found it — which is what the app under test claims for itself.
-shutil.rmtree(TMP, ignore_errors=True)
-print("all good")
+if __name__ == "__main__":
+    asyncio.run(main())
+    # Only on the way out clean: a run that failed leaves its fake tools, logs and
+    # staged files where they can be looked at, and a run that passed leaves the
+    # machine as it found it — which is what the app under test claims for itself.
+    shutil.rmtree(TMP, ignore_errors=True)
+    print("all good")
+
