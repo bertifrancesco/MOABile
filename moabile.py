@@ -55,13 +55,15 @@ from rich.markup import escape
 from rich.style import Style
 from rich.text import Text
 from textual import events, on, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, HorizontalScroll, Vertical
 from textual.css.query import NoMatches
+from textual.geometry import Size
 from textual.message import Message
 from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.theme import Theme
 from textual.timer import Timer
 from textual.widget import Widget
@@ -77,7 +79,7 @@ from textual.widgets import (
     TextArea,
 )
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 # What --help says. There are no options to document: everything this does is
 # chosen inside, with the keys. Printed rather than built with argparse, which
 # would be a dependency's worth of machinery for a program that takes nothing.
@@ -799,10 +801,10 @@ class TerminalPane(Widget):
     """
 
     can_focus = True
+    allow_select = False
     # Every key belongs to the child process — ctrl+c has to reach frida — so
     # the one way back out is a key no REPL uses and this pane never forwards.
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("alt+c", "copy_terminal", "copy", key_display="alt+c"),
         Binding("f8", "leave_terminal", "leave", key_display="f8"),
     ]
 
@@ -822,6 +824,29 @@ class TerminalPane(Widget):
         self.vt: pyte.Screen | None = None
         self.stream: pyte.ByteStream | None = None
         self._styles: dict[tuple, Style] = {}
+        self.history_offset: int = 0
+        self.selection_start: tuple[int, int] | None = None
+        self.selection_end: tuple[int, int] | None = None
+        self._selecting: bool = False
+
+    @property
+    def has_selection(self) -> bool:
+        return (
+            self.selection_start is not None
+            and self.selection_end is not None
+            and self.selection_start != self.selection_end
+        )
+
+    def clear_selection(self) -> None:
+        if self._selecting:
+            with contextlib.suppress(Exception):
+                self.release_mouse()
+            self._selecting = False
+        if self.selection_start is not None or self.selection_end is not None:
+            self.selection_start = None
+            self.selection_end = None
+            self._update_border_subtitle()
+            self.refresh()
 
     @property
     def running(self) -> bool:
@@ -877,13 +902,15 @@ class TerminalPane(Widget):
             return
         self.fd = master
         asyncio.get_running_loop().add_reader(master, self._readable)
-        self.panel.write(f"[dim]$ {self.label}   (alt+c copies, f8 leaves the pane)")
-        self.border_subtitle = " [bold cyan]alt+c: copy[/] · [dim]f8: leave pane[/] "
+        self.panel.write(f"[dim]$ {self.label}   (f8 leaves the pane)")
+        self.border_subtitle = " [dim]f8: leave pane[/] "
         self.focus()
 
     def stop(self) -> None:
         self.starting = False
         self.exited = None
+        self.history_offset = 0
+        self.clear_selection()
         if self.running and self.proc:
             reap(self.proc)
             if self.proc.poll() is None:      # ignored the terminate: insist
@@ -895,6 +922,8 @@ class TerminalPane(Widget):
     def _teardown(self) -> None:
         was_paused = self.exited is not None
         self.exited = None
+        self.history_offset = 0
+        self.clear_selection()
         if self.fd is not None:
             with contextlib.suppress(RuntimeError, ValueError, OSError):
                 asyncio.get_running_loop().remove_reader(self.fd)
@@ -917,6 +946,7 @@ class TerminalPane(Widget):
             name = escape(self.command)
             self.panel.write(f"[red]{name} exited with {code}" if code and code > 0
                              else f"[dim]{name} exited[/]")
+        self.clear_selection()
         self.vt = self.stream = None
         self.border_subtitle = ""
         self.panel.set_class(False, "running")
@@ -940,18 +970,6 @@ class TerminalPane(Widget):
         while lines and not lines[-1]:
             lines.pop()
         return "\n".join(lines)
-
-    def action_copy_terminal(self) -> None:
-        """Open full terminal history in TextViewerScreen and copy to clipboard."""
-        text = self.get_history_text()
-        if not text:
-            self.app.notify("Terminal buffer is empty", severity="information")
-            return
-        self.app.copy_to_clipboard(text)
-        self.app.notify(f"copied terminal session ({len(text)} chars)")
-        self.app.push_screen(TextViewerScreen(
-            f"Terminal session · {self.command}", text
-        ))
 
     def _readable(self) -> None:
         try:
@@ -984,7 +1002,7 @@ class TerminalPane(Widget):
         name = escape(self.command)
         self.panel.write(f"[red]{name} exited with {code} — pane kept open to inspect error[/]")
         self.border_subtitle = (
-            f" [bold red]exited with code {code} · enter / esc close · c copy [/] "
+            f" [bold red]exited with code {code} · enter / esc close[/] "
         )
         self.refresh()
 
@@ -994,15 +1012,224 @@ class TerminalPane(Widget):
 
     action_leave_terminal = action_leave
 
-    def on_click(self, event: events.Click) -> None:
-        if self.running and event.y >= max(0, self.size.height - 1):
-            self.action_copy_terminal()
+    @property
+    def max_history_offset(self) -> int:
+        if (
+            self.vt is not None
+            and hasattr(self.vt, "history")
+            and hasattr(self.vt.history, "top")
+        ):
+            return len(self.vt.history.top)
+        return 0
+
+    def get_all_rows(self) -> list[Any]:
+        if not self.vt:
+            return []
+        lines = self.vt.lines
+        top_rows = (
+            list(self.vt.history.top)
+            if hasattr(self.vt, "history") and hasattr(self.vt.history, "top")
+            else []
+        )
+        return top_rows + [self.vt.buffer[y] for y in range(lines)]
+
+    @property
+    def current_history_start(self) -> int:
+        if not self.vt:
+            return 0
+        all_rows = self.get_all_rows()
+        total = len(all_rows)
+        lines = self.vt.lines
+        top_rows_len = max(0, total - lines)
+        offset = min(self.history_offset, top_rows_len)
+        return max(0, total - lines - offset)
+
+    @property
+    def selection_bounds(self) -> tuple[int, int, int, int] | None:
+        if not self.has_selection or not self.selection_start or not self.selection_end:
+            return None
+        (x0, y0), (x1, y1) = self.selection_start, self.selection_end
+        if (y0, x0) > (y1, x1):
+            (x0, y0), (x1, y1) = (x1, y1), (x0, y0)
+        return (x0, y0, x1, y1)
+
+    def get_visible_rows(self) -> list[Any]:
+        if not self.vt:
+            return []
+        lines = self.vt.lines
+        if self.history_offset == 0:
+            return [self.vt.buffer[y] for y in range(lines)]
+        all_rows = self.get_all_rows()
+        start = self.current_history_start
+        return all_rows[start:start + lines]
+
+    def get_selected_text(self) -> str:
+        if not (sel := self.selection_bounds) or not self.vt:
+            return ""
+        x0, y0, x1, y1 = sel
+        all_rows = self.get_all_rows()
+        cols = self.vt.columns
+        extracted: list[str] = []
+
+        for y in range(y0, min(y1 + 1, len(all_rows))):
+            row = all_rows[y]
+            xs = x0 if y == y0 else 0
+            xe = x1 if y == y1 else cols - 1
+            line_str = "".join(
+                row[x].data or " " for x in range(xs, min(xe + 1, cols))
+            ).rstrip()
+            extracted.append(line_str)
+
+        return "\n".join(extracted).strip()
+
+    def scroll_up(self, count: int = 3, **kwargs: Any) -> None:  # type: ignore[override]
+        if not self.vt:
+            return
+        self.history_offset = min(self.max_history_offset, self.history_offset + count)
+        self._update_border_subtitle()
+        self.refresh()
+
+    def scroll_down(self, count: int = 3, **kwargs: Any) -> None:  # type: ignore[override]
+        if not self.vt:
+            return
+        self.history_offset = max(0, self.history_offset - count)
+        self._update_border_subtitle()
+        self.refresh()
+
+    def _update_border_subtitle(self) -> None:
+        if self.exited is not None:
+            self.border_subtitle = (
+                f" [bold red]exited with code {self.exited} · enter / esc close[/] "
+            )
+        elif self.has_selection:
+            self.border_subtitle = " [bold green]copied selection[/] · [dim]esc clear[/] "
+        elif self.history_offset > 0:
+            max_offset = self.max_history_offset
+            self.border_subtitle = (
+                f" [bold yellow]▲ scroll -{self.history_offset}/{max_offset}[/] · "
+                f"[dim]f8: leave pane[/] "
+            )
+        elif self.running:
+            self.border_subtitle = " [dim]f8: leave pane[/] "
+        else:
+            self.border_subtitle = ""
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self.running:
             event.stop()
             event.prevent_default()
+            self.scroll_up(3)
+            if self._selecting and self.vt:
+                offset_x = self.content_offset.x
+                offset_y = self.content_offset.y
+                cols = self.vt.columns
+                rows = len(self.get_visible_rows())
+                adj_y = event.y - offset_y
+                adj_x = event.x - offset_x
+                x = max(0, min(adj_x, cols - 1))
+                y = self.current_history_start + max(0, min(adj_y, rows - 1))
+                self.selection_end = (x, y)
+                self.refresh()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self.running:
+            event.stop()
+            event.prevent_default()
+            self.scroll_down(3)
+            if self._selecting and self.vt:
+                offset_x = self.content_offset.x
+                offset_y = self.content_offset.y
+                cols = self.vt.columns
+                rows = len(self.get_visible_rows())
+                adj_y = event.y - offset_y
+                adj_x = event.x - offset_x
+                x = max(0, min(adj_x, cols - 1))
+                y = self.current_history_start + max(0, min(adj_y, rows - 1))
+                self.selection_end = (x, y)
+                self.refresh()
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if not self.running or not self.vt or event.button != 1:
+            return
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        rows = len(self.get_visible_rows())
+        cols = self.vt.columns
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        if adj_y < 0 or adj_y >= rows:
+            return
+        self.focus()
+        with contextlib.suppress(Exception):
+            self.capture_mouse()
+        self._selecting = True
+        x = max(0, min(adj_x, cols - 1))
+        y = self.current_history_start + adj_y
+        self.selection_start = (x, y)
+        self.selection_end = (x, y)
+        self.refresh()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._selecting or not self.vt:
+            return
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        rows = len(self.get_visible_rows())
+        cols = self.vt.columns
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        if adj_y < 0:
+            step = max(1, -adj_y)
+            self.scroll_up(step)
+        elif adj_y >= rows:
+            step = max(1, adj_y - rows + 1)
+            self.scroll_down(step)
+        rows = len(self.get_visible_rows())
+        x = max(0, min(adj_x, cols - 1))
+        y = self.current_history_start + max(0, min(adj_y, rows - 1))
+        self.selection_end = (x, y)
+        self.refresh()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if not self._selecting or not self.vt:
+            return
+        with contextlib.suppress(Exception):
+            self.release_mouse()
+        self._selecting = False
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        cols = self.vt.columns
+        rows = len(self.get_visible_rows())
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        x = max(0, min(adj_x, cols - 1))
+        y = self.current_history_start + max(0, min(adj_y, rows - 1))
+        self.selection_end = (x, y)
+        if self.selection_start != self.selection_end:
+            text = self.get_selected_text()
+            if text:
+                self.app.copy_to_clipboard(text)
+                self.app.notify(f"copied selection ({len(text)} chars)")
+        else:
+            self.selection_start = None
+            self.selection_end = None
+        self._update_border_subtitle()
+        self.refresh()
+
+    def on_paste(self, event: events.Paste) -> None:
+        if not self.running or self.fd is None:
+            return
+        event.stop()
+        event.prevent_default()
+        self.history_offset = 0
+        self.clear_selection()
+        if event.text:
+            with contextlib.suppress(OSError):
+                os.write(self.fd, event.text.encode("utf-8"))
 
     def on_key(self, event: events.Key) -> None:
         if self.exited is not None:
-            if event.key.lower() in ("c", "ctrl+c", "alt+c"):
+            if event.key.lower() == "ctrl+c":
                 code = self.exited
                 cmd = self.command
                 plain_text = self.get_history_text() or self.render().plain.strip()
@@ -1020,8 +1247,50 @@ class TerminalPane(Widget):
                 event.stop()
                 event.prevent_default()
             return
-        if event.key.lower() in ("alt+c", "f2"):
-            self.action_copy_terminal()
+        if event.key.lower() in ("shift+pageup", "shift+page_up"):
+            self.scroll_up(max(1, self.size.height // 2))
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() in ("shift+pagedown", "shift+page_down"):
+            self.scroll_down(max(1, self.size.height // 2))
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() == "shift+home":
+            self.history_offset = self.max_history_offset
+            self._update_border_subtitle()
+            self.refresh()
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() == "shift+end":
+            self.history_offset = 0
+            self._update_border_subtitle()
+            self.refresh()
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() in ("ctrl+shift+c", "shift+ctrl+c"):
+            text = self.get_selected_text() or self.render().plain.strip()
+            if text:
+                self.app.copy_to_clipboard(text)
+                self.app.notify(f"copied ({len(text)} chars)")
+                self.clear_selection()
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() == "ctrl+c" and self.has_selection:
+            text = self.get_selected_text()
+            if text:
+                self.app.copy_to_clipboard(text)
+                self.app.notify(f"copied selection ({len(text)} chars)")
+            self.clear_selection()
+            event.stop()
+            event.prevent_default()
+            return
+        if event.key.lower() == "escape" and self.has_selection:
+            self.clear_selection()
             event.stop()
             event.prevent_default()
             return
@@ -1030,6 +1299,11 @@ class TerminalPane(Widget):
         # along with the rest.
         if event.key == "f8" or not self.running or self.fd is None:
             return
+        if self.history_offset > 0:
+            self.history_offset = 0
+            self._update_border_subtitle()
+        if self.has_selection:
+            self.clear_selection()
         event.stop()
         event.prevent_default()
         data = KEYS.get(event.key)
@@ -1047,6 +1321,8 @@ class TerminalPane(Widget):
                 os.write(self.fd, data)
 
     def on_resize(self) -> None:
+        self.history_offset = 0
+        self.clear_selection()
         if self.running and self.vt and self.fd is not None:
             cols, rows = max(20, self.size.width), max(5, self.size.height)
             if (rows, cols) == (self.vt.lines, self.vt.columns):
@@ -1059,33 +1335,63 @@ class TerminalPane(Widget):
         if not self.vt:
             return Text("")
         cursor = self.vt.cursor
+        show_cursor = self.history_offset == 0 and not cursor.hidden
         out = Text()
-        for y in range(self.vt.lines):
-            row = self.vt.buffer[y]
+        rows = self.get_visible_rows()
+
+        sel = self.selection_bounds
+
+        num_rows = len(rows)
+        start = self.current_history_start
+        for y, row in enumerate(rows):
             # Runs of identical style, so a full repaint is a few dozen spans
             # instead of one per character cell.
+            abs_row = start + y
             run, style = "", None
             for x in range(self.vt.columns):
                 char = row[x]
-                key = (char.fg, char.bg, char.bold, char.italics, char.underscore,
-                       char.reverse, not cursor.hidden and y == cursor.y and x == cursor.x)
+                is_cursor = show_cursor and y == cursor.y and x == cursor.x
+                is_selected = False
+                if sel is not None:
+                    x0, y0, x1, y1 = sel
+                    if y0 == y1:
+                        is_selected = abs_row == y0 and x0 <= x <= x1
+                    elif abs_row == y0:
+                        is_selected = x >= x0
+                    elif abs_row == y1:
+                        is_selected = x <= x1
+                    elif y0 < abs_row < y1:
+                        is_selected = True
+
+                is_rev = bool(is_cursor ^ char.reverse ^ is_selected)
+                key = (
+                    char.fg,
+                    char.bg,
+                    char.bold,
+                    char.italics,
+                    char.underscore,
+                    is_rev,
+                )
                 # Building a Style per cell per repaint dominated the cost of
                 # drawing the pane; there are only a handful of distinct ones.
                 if (here := self._styles.get(key)) is None:
                     here = self._styles[key] = Style(
-                        color=pyte_color(char.bg if char.reverse else char.fg),
-                        bgcolor=pyte_color(char.fg if char.reverse else char.bg),
-                        bold=char.bold, italic=char.italics,
-                        underline=char.underscore, reverse=key[-1],
+                        color=pyte_color(char.fg),
+                        bgcolor=pyte_color(char.bg),
+                        bold=char.bold,
+                        italic=char.italics,
+                        underline=char.underscore,
+                        reverse=is_rev,
                     )
                 if here is not style:
                     out.append(run, style)
                     run, style = "", here
                 run += char.data or " "
             out.append(run, style)
-            if y != self.vt.lines - 1:
+            if y != num_rows - 1:
                 out.append("\n")
         return out
+
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -1300,16 +1606,33 @@ class DepsScreen(ModalScreen[str]):
 class AskScreen(ModalScreen[str | None]):
     """One line of text, prefilled with whatever it was before."""
 
-    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "cancel")]
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "cancel"),
+        Binding("up", "history_prev", "previous", show=False),
+        Binding("down", "history_next", "next", show=False),
+    ]
     CSS = modal_css("AskScreen", 92)
     HINT = "[dim]enter accept · esc cancel[/]"
 
-    def __init__(self, title: str, value: str, hint: str = "", secret: bool = False) -> None:
+    def __init__(
+        self,
+        title: str,
+        value: str,
+        hint: str = "",
+        secret: bool = False,
+        history: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self.title_text, self.value, self.hint = title, value, hint
         # A password is the one thing asked for here that must not be on
         # screen: panels are shared, and screenshots are one key away.
         self.secret = secret
+        self.history = history
+        self._history_idx = len(history) if history is not None else 0
+        self._draft: str | None = None
+        if self.history and self.value.strip() and self.value.strip() == self.history[-1]:
+            self._history_idx = len(self.history) - 1
+            self._draft = self.value
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
@@ -1317,7 +1640,11 @@ class AskScreen(ModalScreen[str | None]):
             if self.hint:
                 yield Static(f"[dim]{escape(self.hint)}[/]")
             yield Input(value=self.value, id="answer", password=self.secret)
-            yield Static(self.HINT)
+            hint_text = self.HINT
+            if self.history is not None:
+                hint_text = hint_text.replace("enter accept", "enter accept · ↑/↓ history")
+                hint_text = hint_text.replace("enter run", "enter run · ↑/↓ history")
+            yield Static(hint_text)
 
     def on_mount(self) -> None:
         # NoMatches: a modal can be pushed and taken off again before its own
@@ -1325,9 +1652,43 @@ class AskScreen(ModalScreen[str | None]):
         with contextlib.suppress(NoMatches):
             self.query_one("#answer", Input).focus()
 
+    def action_history_prev(self) -> None:
+        """Recall previous entry in history (up arrow)."""
+        if not self.history:
+            return
+        answer = self.query_one("#answer", Input)
+        if self._history_idx == len(self.history):
+            self._draft = answer.value
+        elif self._history_idx == len(self.history) - 1 and answer.value != self.history[-1]:
+            self._draft = answer.value
+            self._history_idx = len(self.history)
+        if self._history_idx > 0:
+            self._history_idx -= 1
+            answer.value = self.history[self._history_idx]
+            answer.action_end()
+
+    def action_history_next(self) -> None:
+        """Recall next entry in history (down arrow)."""
+        if not self.history or self._history_idx >= len(self.history):
+            return
+        answer = self.query_one("#answer", Input)
+        self._history_idx += 1
+        if self._history_idx == len(self.history):
+            answer.value = self._draft or ""
+        else:
+            answer.value = self.history[self._history_idx]
+        answer.action_end()
+
     @on(Input.Submitted)
     def submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value)
+        val = event.value
+        if self.history is not None and not self.secret:
+            clean = val.strip()
+            if clean:
+                with contextlib.suppress(ValueError):
+                    self.history.remove(clean)
+                self.history.append(clean)
+        self.dismiss(val)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1347,8 +1708,15 @@ class FridaArgsScreen(AskScreen):
     ]
     HINT = "[dim]enter run · ctrl+o open script · ctrl+g get from codeshare · esc cancel[/]"
 
-    def __init__(self, title: str, value: str, hint: str = "", local_dir: str = ".") -> None:
-        super().__init__(title, value, hint)  # never secret: these are arguments
+    def __init__(
+        self,
+        title: str,
+        value: str,
+        hint: str = "",
+        local_dir: str = ".",
+        history: list[str] | None = None,
+    ) -> None:
+        super().__init__(title, value, hint, history=history)  # never secret: these are arguments
         # Where the script browser opens, and where it was left: the caller
         # reads it back off the screen to remember it for next time.
         self.local_dir = local_dir
@@ -1370,6 +1738,44 @@ class FridaArgsScreen(AskScreen):
     async def action_pick_codeshare(self) -> None:
         if slug := await self.app.push_screen_wait(CodeshareScreen()):
             self.add(f"--codeshare {slug}")
+
+
+class ObjectionArgsScreen(AskScreen):
+    """The objection argument line, for startup commands and scripts.
+
+    ctrl+o browses the disk for a script to load at startup (--startup-script),
+    and custom startup commands or flags can be typed directly.
+    """
+
+    CSS = modal_css("ObjectionArgsScreen", 92)
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("ctrl+o", "pick_local", "open script"),
+    ]
+    HINT = "[dim]enter run · ctrl+o startup script · esc cancel · empty for default[/]"
+
+    def __init__(
+        self,
+        title: str,
+        value: str,
+        hint: str = "",
+        local_dir: str = ".",
+        history: list[str] | None = None,
+    ) -> None:
+        super().__init__(title, value, hint, history=history)
+        self.local_dir = local_dir
+
+    def add(self, token: str) -> None:
+        """Append an argument, leaving the cursor after it."""
+        answer = self.query_one("#answer", Input)
+        answer.value = f"{answer.value.strip()} {token}".strip()
+        answer.action_end()
+        answer.focus()
+
+    @work
+    async def action_pick_local(self) -> None:
+        if path := await self.app.push_screen_wait(ScriptScreen(self.local_dir)):
+            self.local_dir = str(Path(path).parent)
+            self.add(f"--startup-script {shlex.quote(path)}")
 
 
 class ConfirmScreen(ModalScreen[Any]):
@@ -1439,7 +1845,7 @@ class TextViewerScreen(ModalScreen[None]):
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape,q,enter", "dismiss_viewer", "close"),
-        Binding("ctrl+c,c", "copy_text", "copy", priority=True),
+        Binding("ctrl+c", "copy_text", "copy", priority=True),
         Binding("ctrl+a", "select_all", "select all", priority=True),
     ]
 
@@ -1454,7 +1860,7 @@ class TextViewerScreen(ModalScreen[None]):
             yield Static(f"[b]{escape(self.title_text)}[/]  [dim]({nlines} lines)[/]")
             yield TextArea(self.content_text, read_only=True, id="viewer-area")
             yield Static(
-                "[dim]esc / q / enter close · c / ctrl+c copy · ctrl+a select all[/]"
+                "[dim]esc / q / enter close · ctrl+c copy · ctrl+a select all[/]"
             )
 
     def on_mount(self) -> None:
@@ -1474,6 +1880,13 @@ class TextViewerScreen(ModalScreen[None]):
     def action_select_all(self) -> None:
         area = self.query_one("#viewer-area", TextArea)
         area.select_all()
+
+    def on_mouse_up(self, _event: events.MouseUp) -> None:
+        with contextlib.suppress(NoMatches):
+            area = self.query_one("#viewer-area", TextArea)
+            if area.selected_text:
+                self.app.copy_to_clipboard(area.selected_text)
+                self.notify(f"copied selection ({len(area.selected_text)} chars)")
 
 
 
@@ -2198,6 +2611,202 @@ class CodeshareScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+def highlight_strip(strip: Strip, start_col: int, end_col: int) -> Strip:
+    """Apply inverse highlight style to a column slice of a Strip."""
+    cell_len = strip.cell_length
+    if cell_len == 0 or start_col >= end_col:
+        return strip
+    start = max(0, min(start_col, cell_len))
+    end = max(0, min(end_col, cell_len))
+    if start >= end:
+        return strip
+    if start == 0 and end == cell_len:
+        return strip.apply_style(Style(reverse=True))
+
+    cuts: list[int] = []
+    if start > 0:
+        cuts.append(start)
+    if end < cell_len:
+        cuts.append(end)
+    cuts.append(cell_len)
+
+    parts = list(strip.divide(cuts))
+    sel_idx = 1 if start > 0 else 0
+    parts[sel_idx] = parts[sel_idx].apply_style(Style(reverse=True))
+    return Strip.join(parts)
+
+
+class LogPane(RichLog):
+    """Device output log with native text selection and copy-on-select."""
+
+    allow_select = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.selection_start: tuple[int, int] | None = None
+        self.selection_end: tuple[int, int] | None = None
+        self._selecting = False
+
+    @property
+    def has_selection(self) -> bool:
+        return (
+            self.selection_start is not None
+            and self.selection_end is not None
+            and self.selection_start != self.selection_end
+        )
+
+    @property
+    def selection_bounds(self) -> tuple[int, int, int, int] | None:
+        if not self.has_selection or not self.selection_start or not self.selection_end:
+            return None
+        p1, p2 = self.selection_start, self.selection_end
+        if (p1[1], p1[0]) <= (p2[1], p2[0]):
+            return p1[0], p1[1], p2[0], p2[1]
+        return p2[0], p2[1], p1[0], p1[1]
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        if not self.has_selection or not (sel := self.selection_bounds):
+            return strip
+        x0, y0, x1, y1 = sel
+        line_idx = self.scroll_offset.y + y
+        if line_idx < y0 or line_idx > y1:
+            return strip
+        if y0 == y1:
+            return highlight_strip(strip, x0, x1)
+        if line_idx == y0:
+            return highlight_strip(strip, x0, strip.cell_length)
+        if line_idx == y1:
+            return highlight_strip(strip, 0, x1)
+        return highlight_strip(strip, 0, strip.cell_length)
+
+    def get_selected_text(self) -> str:
+        if not self.has_selection or not (sel := self.selection_bounds):
+            return ""
+        x0, y0, x1, y1 = sel
+        if not self.lines:
+            return ""
+        y0 = max(0, min(y0, len(self.lines) - 1))
+        y1 = max(0, min(y1, len(self.lines) - 1))
+        extracted: list[str] = []
+        for y in range(y0, y1 + 1):
+            line_str = self.lines[y].text.rstrip()
+            if y0 == y1:
+                extracted.append(line_str[x0:x1])
+            elif y == y0:
+                extracted.append(line_str[x0:])
+            elif y == y1:
+                extracted.append(line_str[:x1])
+            else:
+                extracted.append(line_str)
+        return "\n".join(extracted).strip("\n")
+
+    def clear_selection(self) -> None:
+        if self._selecting:
+            with contextlib.suppress(Exception):
+                self.release_mouse()
+            self._selecting = False
+        if self.selection_start is not None or self.selection_end is not None:
+            self.selection_start = None
+            self.selection_end = None
+            self.refresh()
+
+    def clear(self) -> LogPane:
+        self.clear_selection()
+        super().clear()
+        return self
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != 1:
+            return
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        h = max(1, self.scrollable_content_region.height)
+        if adj_y < 0 or adj_y >= h:
+            return
+        with contextlib.suppress(Exception):
+            self.capture_mouse()
+        self._selecting = True
+        scroll_y = self.scroll_offset.y
+        y = scroll_y + adj_y
+        self.selection_start = (max(0, adj_x), y)
+        self.selection_end = (max(0, adj_x), y)
+        self.refresh()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if not self._selecting:
+            return
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        h = max(1, self.scrollable_content_region.height)
+        if adj_y < 0:
+            step = max(1, -adj_y)
+            self.scroll_relative(y=-step, animate=False)
+        elif adj_y >= h:
+            step = max(1, adj_y - h + 1)
+            self.scroll_relative(y=step, animate=False)
+        scroll_y = self.scroll_offset.y
+        y = scroll_y + max(0, min(adj_y, h - 1))
+        self.selection_end = (max(0, adj_x), y)
+        self.refresh()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if not self._selecting:
+            return
+        with contextlib.suppress(Exception):
+            self.release_mouse()
+        self._selecting = False
+        offset_x = self.content_offset.x
+        offset_y = self.content_offset.y
+        adj_x = event.x - offset_x
+        adj_y = event.y - offset_y
+        h = max(1, self.scrollable_content_region.height)
+        scroll_y = self.scroll_offset.y
+        y = scroll_y + max(0, min(adj_y, h - 1))
+        self.selection_end = (max(0, adj_x), y)
+        if self.selection_start != self.selection_end:
+            text = self.get_selected_text()
+            if text:
+                self.app.copy_to_clipboard(text)
+                self.app.notify(f"copied selection ({len(text)} chars)")
+        else:
+            self.selection_start = None
+            self.selection_end = None
+        self.refresh()
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        if self._selecting:
+            self.scroll_relative(y=-3, animate=False)
+            scroll_y = self.scroll_offset.y
+            h = max(1, self.scrollable_content_region.height)
+            y = scroll_y + max(0, min(event.y, h - 1))
+            self.selection_end = (self.selection_end[0] if self.selection_end else 0, y)
+            self.refresh()
+            event.stop()
+            event.prevent_default()
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        if self._selecting:
+            self.scroll_relative(y=3, animate=False)
+            scroll_y = self.scroll_offset.y
+            h = max(1, self.scrollable_content_region.height)
+            y = scroll_y + max(0, min(event.y, h - 1))
+            self.selection_end = (self.selection_end[0] if self.selection_end else 0, y)
+            self.refresh()
+            event.stop()
+            event.prevent_default()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key.lower() == "escape" and self.has_selection:
+            self.clear_selection()
+            event.stop()
+            event.prevent_default()
+
+
 class DevicePanel(Vertical):
     """One attached device: stats, a log, and a pty for whatever is running.
 
@@ -2236,6 +2845,7 @@ class DevicePanel(Vertical):
         # leaving nothing behind, on the device or off it.
         self.package: str | None = None
         self.frida_args: str = ""
+        self.objection_args: str = ""
         self.remote_dir: str = self.home_dir
         self.local_dir: str = str(Path.cwd())
         self.script_dir: str = str(Path.cwd())
@@ -2272,7 +2882,7 @@ class DevicePanel(Vertical):
         # REPL is up.
         # markup=False on purpose: everything is written as a Text object, so a
         # subprocess line containing "[/]" cannot be parsed as markup and crash.
-        yield RichLog(id=f"log-{self.uid}", markup=False, wrap=True, max_lines=2000)
+        yield LogPane(id=f"log-{self.uid}", markup=False, wrap=True, max_lines=2000)
         yield TerminalPane(self)
 
     @property
@@ -2821,7 +3431,8 @@ class DevicePanel(Vertical):
                     return False
             if choice == "c":
                 chosen = await self.mob.push_screen_wait(AskScreen(
-                    "install specific frida version", "", "e.g. 16.7.19 or 15.2.2"
+                    "install specific frida version", "", "e.g. 16.7.19 or 15.2.2",
+                    history=getattr(self.mob, "frida_version_history", None),
                 ))
                 if not chosen or not chosen.strip():
                     return False
@@ -3200,17 +3811,39 @@ class AndroidPanel(DevicePanel):
     async def frida_blocker(self) -> str | None:
         return None if self.root else "frida-server needs root; without it use objection patchapk"
 
+    async def detect_art_update(self) -> bool:
+        """Detect if Google Play ART update (com.google.android.art) is present.
+
+        ART updates delivered via Google Play Mainline are APEX packages
+        (see frida/frida#2958 and #3639). Standard 'pm list packages' omits APEX
+        packages on modern Android. We probe multiple vectors:
+        1. 'pm path com.google.android.art'
+        2. 'pm list packages --apex-only com.google.android.art'
+        3. 'pm list packages -s com.google.android.art'
+        4. 'pm list packages com.google.android.art'
+        5. Active APEX in /data/apex/active/com.google.android.art*
+        """
+        probe = (
+            "pm path com.google.android.art 2>/dev/null || "
+            "pm list packages --apex-only com.google.android.art 2>/dev/null || "
+            "pm list packages -s com.google.android.art 2>/dev/null || "
+            "pm list packages com.google.android.art 2>/dev/null || "
+            "ls -d /data/apex/active/com.google.android.art* 2>/dev/null || "
+            "ls -d /apex/com.google.android.art 2>/dev/null"
+        )
+        rc, out = await self.adb("shell", probe)
+        return rc == 0 and "com.google.android.art" in out
+
     async def check_art_module(self) -> bool:
         """Check for Google Play ART update (com.google.android.art), which breaks frida."""
         if getattr(self, "_art_warned", False):
             return True
-        rc, out = await self.adb("shell", "pm", "list", "packages", "com.google.android.art")
-        if rc != 0 or "com.google.android.art" not in out:
+        if not await self.detect_art_update():
             return True
         self._art_warned = True
         choice = await self.mob.push_screen_wait(ConfirmScreen(
             f"ART update detected on {self.serial} (com.google.android.art)",
-            "uninstall update & reboot device (fixes frida/frida#3639)",
+            "uninstall update & reboot device (fixes frida/frida#2958, #3639)",
             "continue anyway (frida may crash)",
         ))
         if choice:
@@ -3228,7 +3861,7 @@ class AndroidPanel(DevicePanel):
                 await self.adb("shell", "reboot")
             return False
         self.write("[yellow]warning:[/] com.google.android.art is active"
-                   " — frida may crash (see frida/frida#3639)")
+                   " — frida may crash (see frida/frida#2958, #3639)")
         return True
 
     async def clear_app_data(self) -> bool:
@@ -3258,13 +3891,10 @@ class AndroidPanel(DevicePanel):
                                                   out, re.MULTILINE))
         if not self.props:
             self.fail(f"{last_line(out) or 'getprop said nothing'} for {self.serial}"
-                      " — the device stopped answering adb; replug it, then r")
+                       " — the device stopped answering adb; replug it, then r")
         _, who = await self.adb("shell", "su", "-c", "id")
         self.root = "uid=0" in who
-        rc_art, out_art = await self.adb(
-            "shell", "pm", "list", "packages", "com.google.android.art"
-        )
-        self.has_art_module = (rc_art == 0 and "com.google.android.art" in out_art)
+        self.has_art_module = await self.detect_art_update()
         # Escaped: these come from the device. Static.update() has no fallback
         # for bad markup, so a model name containing "[/]" would take the panel
         # down the way logcat lines once took down the log.
@@ -3385,7 +4015,7 @@ class AndroidPanel(DevicePanel):
                       "[red]no — su is missing or refused[/]"))
         if getattr(self, "has_art_module", False):
             self.write(f"  [b]{'art':<8}[/] "
-                       "[yellow]com.google.android.art detected (frida issue #3639)[/]")
+                       "[yellow]com.google.android.art detected (frida issue #2958, #3639)[/]")
 
     async def install(self, path: str) -> tuple[int, str]:
         self.write(f"[dim]$ adb install -r {path}")
@@ -4100,7 +4730,7 @@ class IosPanel(DevicePanel):
         # as "Words, Inc") contains that exact separator, and a blind split
         # shifted every column after it.
         for fields in csv.reader(out.splitlines(), skipinitialspace=True):
-            row = dict(zip(columns, (f.strip() for f in fields)))
+            row = dict(zip(columns, (f.strip() for f in fields), strict=False))
             # is_package drops the tool's own header row along with anything
             # that is not an identifier: neither has a dot in it. Apple's own
             # bundles are dropped so the sidebar is not flooded with system apps.
@@ -4696,8 +5326,14 @@ class IosPanel(DevicePanel):
         if path := self.data_containers.get(self.package):
             return path
         for pat in (
-            "/var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist",
-            "/private/var/mobile/Containers/Data/Application/*/.com.apple.mobile_container_manager.metadata.plist",
+            (
+                "/var/mobile/Containers/Data/Application/*"
+                "/.com.apple.mobile_container_manager.metadata.plist"
+            ),
+            (
+                "/private/var/mobile/Containers/Data/Application/*"
+                "/.com.apple.mobile_container_manager.metadata.plist"
+            ),
         ):
             if found := await self.dir_holding(pat):
                 self.data_containers[self.package] = found
@@ -5018,17 +5654,36 @@ class IosPanel(DevicePanel):
 class MOABile(App):
     CSS = """
     #body { height: 1fr; }
-    #side { width: 34; border-right: solid $panel; }
+    #side { width: 34; min-width: 22; border-right: solid $panel; }
     /* The apps of the active device sit at the foot of the sidebar rather than
        flush under the device rows: the two lists answer different questions,
        and stacked together the second one read as more of the first. The
        ceiling is what keeps a long app list from squeezing the devices off
        the top. */
-    #apps { dock: bottom; height: auto; max-height: 60%; }
+    #apps {
+        dock: bottom;
+        height: auto;
+        max-height: 60%;
+        overflow: hidden;
+    }
     /* Past the twelve rows every other list here stops at: the app list is
        the one with hundreds of entries behind it, and the block above already
        caps it at a share of the sidebar. */
-    #packages { max-height: 100%; }
+    #packages {
+        height: auto;
+        max-height: 12;
+        overflow-x: auto;
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
+    }
+    #packages > ListItem {
+        width: auto;
+        min-width: 100%;
+    }
+    #packages > ListItem > Label {
+        width: auto;
+    }
     /* Which device the keys are about. Several panels can be open at once and
        only one of them is listening, so the row for it carries the same accent
        as the border of the panel itself. The weight and the colour and not a
@@ -5105,10 +5760,6 @@ class MOABile(App):
                         " whole or filtered to the app"),
         Binding("slash", "filter_logs", "log filter", key_display="/",
                 tooltip="filter log stream by keyword"),
-        Binding("c", "text_viewer", "copy",
-                tooltip="open log history in text viewer to select and copy"),
-        Binding("alt+c", "copy_terminal", "copy terminal", show=False,
-                tooltip="open terminal session history in text viewer to select and copy"),
         Binding("f8", "leave_terminal", "leave terminal", show=False,
                 tooltip="return keyboard focus from the terminal pane to the panel"),
         Binding("d", "files", "files",
@@ -5136,14 +5787,14 @@ class MOABile(App):
     ]
     # A key is the first letter of the word beside it in the bar wherever the
     # letter was free — the bar is where a command is found, and a key standing
-    # for nothing in it has to be memorised twice. Three of them could not have
-    # their own letter: b for the sidebar (its bar), v for svg, and d for files,
-    # which is the directory key every file manager has. k for clear is the one
+    # for nothing in it has to be memorised twice. A few could not have their own
+    # letter: b for the sidebar (its bar), v for svg, d for files, x for wipe,
+    # slash for log filter, and f8 to leave the terminal. k for clear is the
     # plain convention, the way it clears a line in a shell.
     #
-    # All nineteen need about 155 columns, so a narrower terminal shows the
-    # front of the bar and h opens the panel with the rest — which is why h is
-    # pinned to the end of the row instead of scrolling with the seventeen it
+    # The commands across the bar need a wide terminal; a narrower terminal
+    # shows the front of the bar and h opens the panel with the rest — which is why
+    # h is pinned to the end of the row instead of scrolling with the others it
     # is there to recover. The help panel lists it and b either way: it drops
     # Textual's own bindings and keeps ours, shown in the bar or not.
     # No command palette: every command is a key in the bar below, and a
@@ -5169,6 +5820,11 @@ class MOABile(App):
         # of it: see show_packages().
         self._drawn: tuple = ()
         self._filtering: Timer | None = None
+        # Session-wide in-memory history for prompts (nothing written to disk)
+        self.frida_history: list[str] = []
+        self.objection_history: list[str] = []
+        self.filter_history: list[str] = []
+        self.frida_version_history: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -5226,13 +5882,39 @@ class MOABile(App):
         return BarKey(key, binding.description, binding.tooltip, id=f"barkey-{key}")
 
     def _update_barkey_visibility(self) -> None:
-        hide = isinstance(self.focused, (Input, TextArea, TerminalPane))
+        try:
+            focused = self.focused
+        except (ScreenStackError, AttributeError):
+            focused = None
+        hide = isinstance(focused, (Input, TextArea, TerminalPane))
         for key_id in ("barkey-b", "barkey-h"):
             with contextlib.suppress(NoMatches):
                 self.query_one(f"#{key_id}", BarKey).display = not hide
 
     def on_descendant_blur(self, _event: events.DescendantBlur) -> None:
         self._update_barkey_visibility()
+
+    def _update_layout_responsiveness(self, size: Size | None = None) -> None:
+        with contextlib.suppress(NoMatches):
+            curr_size = size or self.size
+            side = self.query_one("#side", Vertical)
+            if curr_size.width < 90:
+                side.styles.width = max(24, min(34, int(curr_size.width * 0.35)))
+            else:
+                side.styles.width = 34
+            self._update_package_list_height(curr_size)
+
+    def _update_package_list_height(self, size: Size | None = None) -> None:
+        with contextlib.suppress(NoMatches):
+            lv = self.query_one("#packages", ListView)
+            curr_size = size or self.size
+            if curr_size.height < 24:
+                body_h = max(6, curr_size.height - 2)
+                apps_max_h = max(5, int(body_h * 0.6))
+                max_pkgs = max(2, apps_max_h - 4)
+                lv.styles.max_height = min(12, max_pkgs)
+            else:
+                lv.styles.max_height = 12
 
     def on_mount(self) -> None:
         # The one place the capitals survive: paths and the command are all
@@ -5249,7 +5931,11 @@ class MOABile(App):
                 if name not in KEEP_THEMES:
                     self.unregister_theme(name)
             self.theme = KEEP_THEMES[0]
+        self._update_layout_responsiveness()
         self.startup()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._update_layout_responsiveness(event.size)
 
     @work
     async def startup(self) -> None:
@@ -5372,7 +6058,7 @@ class MOABile(App):
             panels = self.panels
             results = await asyncio.gather(*(p.refresh_stats() for p in panels),
                                            return_exceptions=True)
-            for p, result in zip(panels, results):
+            for p, result in zip(panels, results, strict=True):
                 if isinstance(result, Exception):
                     p.fail(f"stats: {result}")
         finally:
@@ -5583,6 +6269,7 @@ class MOABile(App):
         # this is one mount for the whole list.
         lv.extend(([ValueItem("", Text("(no app)", "dim"))] if panel else [])
                   + [ValueItem(p, Text(p)) for p in drawing])
+        self._update_package_list_height()
         self.mark_active()
 
     @on(Input.Changed, "#filter")
@@ -5697,7 +6384,7 @@ class MOABile(App):
         prompt = FridaArgsScreen(
             f"frida arguments for {panel.package}", panel.frida_args,
             "--codeshare user/script  -l script.js  -l /path/other.js",
-            panel.script_dir,
+            panel.script_dir, history=self.frida_history,
         )
         answer = await self.push_screen_wait(prompt)
         panel.script_dir = prompt.local_dir
@@ -5744,6 +6431,21 @@ class MOABile(App):
         if not panel.package:
             panel.fail(NO_APP)
             return
+        prompt = ObjectionArgsScreen(
+            f"objection arguments for {panel.package}", panel.objection_args,
+            '--startup-command "android sslpinning disable"  --startup-script script.js',
+            panel.script_dir, history=self.objection_history,
+        )
+        answer = await self.push_screen_wait(prompt)
+        panel.script_dir = prompt.local_dir
+        if answer is None:
+            return
+        panel.objection_args = answer
+        try:
+            extra = shlex.split(answer)
+        except ValueError as exc:            # unbalanced quotes in the arguments
+            panel.fail(f"bad objection arguments: {exc}")
+            return
         if not await panel.ensure_frida():
             panel.fail("objection needs frida-server on the device")
             return
@@ -5775,7 +6477,7 @@ class MOABile(App):
         # The label, because the command line now says a number: the pane's
         # border is where "which app is this" gets answered.
         objection_cmd = await panel.get_objection_cmd()
-        panel.start_tool([objection_cmd, "-S", panel.serial, "-n", pid, "start"],
+        panel.start_tool([objection_cmd, "-S", panel.serial, "-n", pid, "start", *extra],
                          f"objection {panel.package} (pid {pid})")
 
     def _panel_index(self, panel: DevicePanel) -> int:
@@ -5815,7 +6517,8 @@ class MOABile(App):
             if panel.mirror_tool == "ioscpy":
                 panel.write("[bold yellow]To enable screen mirroring on iOS:[/]")
                 panel.write(
-                    "  1. In Sileo or Zebra, add: [b]https://lautarovculic.github.io/ioscpy-repo/[/]"
+                    "  1. In Sileo or Zebra, add: "
+                    "[b]https://lautarovculic.github.io/ioscpy-repo/[/]"
                 )
                 panel.write("  2. Install the package [b]'ioscpy'[/] (com.ioscpy.device)")
                 panel.write("  3. Respring the device, then press [b]w[/] again")
@@ -5825,6 +6528,10 @@ class MOABile(App):
         i = self._panel_index(panel)
         pid = panel.mirror.pid if panel.mirror else "?"
         panel.write(f"{panel.mirror_tool} window {i + 1} (pid {pid})")
+        if panel.mirror_tool == "ioscpy":
+            panel.write(
+                "[dim]tip: tap the iPhone screen once physically to enable mouse control[/]"
+            )
         # Check if the process exited immediately (e.g. handshake or connection failure)
         await asyncio.sleep(0.4)
         if panel.mirror and panel.mirror.poll() is not None:
@@ -5934,6 +6641,7 @@ class MOABile(App):
             "filter log stream by keyword",
             panel.log_filter,
             "case-insensitive · leave empty to show all lines",
+            history=self.filter_history,
         ))
         if filter_kw is None:
             return
@@ -5945,38 +6653,6 @@ class MOABile(App):
         else:
             panel.write("[dim]log filter cleared: showing all lines[/]")
         await panel.refresh_stats()
-
-    @work(group="action")
-    async def action_text_viewer(self) -> None:
-        """Open the active panel's log history in a selectable text viewer modal."""
-        if not (panel := self.target()):
-            return
-        history = panel.log_history
-        content = "\n".join(history) if history else ""
-        with contextlib.suppress(NoMatches):
-            tp = panel.query_one(TerminalPane)
-            if tp.running and tp.vt:
-                term_txt = tp.get_history_text()
-                if term_txt:
-                    header = f"--- Terminal Session ({tp.command}) ---"
-                    sep = f"\n\n{header}\n" if content else f"{header}\n"
-                    content = f"{content}{sep}{term_txt}"
-        if not content and getattr(panel, "last_terminal_output", None):
-            header = "--- Last Terminal Session ---"
-            content = f"{header}\n{panel.last_terminal_output}"
-        if not content:
-            content = "No log or terminal entries recorded yet."
-        title = f"Log viewer · {panel.serial}"
-        await self.push_screen_wait(TextViewerScreen(title, content))
-
-    def action_copy_terminal(self) -> None:
-        """Open terminal session history in text viewer to select and copy."""
-        if isinstance(self.focused, TerminalPane):
-            self.focused.action_copy_terminal()
-        elif (panel := self.target()):
-            pane = panel.query(TerminalPane).first()
-            if pane:
-                pane.action_copy_terminal()
 
     def action_leave_terminal(self) -> None:
         """Return keyboard focus from the terminal pane to the panel."""
@@ -6023,7 +6699,7 @@ class MOABile(App):
         panel.local_dir = picker.side.path
         if dest:
             existing = await panel.existing_exports(dest)
-            names = ", ".join(l.name for l in existing)
+            names = ", ".join(f.name for f in existing)
             if existing and not await self.push_screen_wait(ConfirmScreen(
                 f"overwrite {names} in {dest}?", "overwrite", "cancel",
             )):
@@ -6121,13 +6797,114 @@ class MOABile(App):
             self.action_show_help_panel()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if isinstance(self.focused, (Input, TextArea)):
+        try:
+            focused = self.focused
+        except (ScreenStackError, AttributeError):
+            focused = None
+        if isinstance(focused, (Input, TextArea)):
             return False
-        if isinstance(self.focused, TerminalPane):
-            if getattr(self.focused, "exited", None) is not None:
-                return action in ("text_viewer", "copy_terminal", "leave_terminal")
-            return action in ("copy_terminal", "leave_terminal")
+        if isinstance(focused, TerminalPane):
+            return action in ("leave_terminal",)
         return super().check_action(action, parameters)
+
+    @on(events.TextSelected)
+    def on_text_selected(self, _event: events.TextSelected) -> None:
+        """Copy-on-select across all widgets supporting Textual selection."""
+        if (text := self.screen.get_selected_text()):
+            self.copy_to_clipboard(text)
+            self.notify(f"copied selection ({len(text)} chars)")
+
+    def on_mouse_up(self, _event: events.MouseUp) -> None:
+        try:
+            focused = self.focused
+        except (ScreenStackError, AttributeError):
+            focused = None
+        if isinstance(focused, TextArea) and focused.selected_text:
+            text = focused.selected_text
+            self.copy_to_clipboard(text)
+            self.notify(f"copied selection ({len(text)} chars)")
+
+    def on_key(self, event: events.Key) -> None:
+        try:
+            focused = self.focused
+        except (ScreenStackError, AttributeError):
+            focused = None
+        if isinstance(focused, (Input, TextArea)):
+            return
+        if event.key.lower() in ("ctrl+shift+c", "shift+ctrl+c"):
+            if (panel := self.target()):
+                if panel.term.running and panel.term.has_selection:
+                    text = panel.term.get_selected_text()
+                    if text:
+                        self.copy_to_clipboard(text)
+                        self.notify(f"copied selection ({len(text)} chars)")
+                        event.stop()
+                        event.prevent_default()
+                        return
+                with contextlib.suppress(NoMatches):
+                    log_pane = panel.query_one(LogPane)
+                    if log_pane.has_selection:
+                        text = log_pane.get_selected_text()
+                        if text:
+                            self.copy_to_clipboard(text)
+                            self.notify(f"copied selection ({len(text)} chars)")
+                            event.stop()
+                            event.prevent_default()
+                            return
+            if (sel := self.screen.get_selected_text()):
+                self.copy_to_clipboard(sel)
+                self.notify(f"copied selection ({len(sel)} chars)")
+                event.stop()
+                event.prevent_default()
+            elif (panel := self.target()):
+                log_txt = "\n".join(panel.log_history)
+                if log_txt:
+                    self.copy_to_clipboard(log_txt)
+                    self.notify(f"copied panel log ({len(log_txt)} chars)")
+                    event.stop()
+                    event.prevent_default()
+        elif event.key.lower() == "ctrl+c":
+            if (panel := self.target()):
+                if panel.term.running and panel.term.has_selection:
+                    text = panel.term.get_selected_text()
+                    if text:
+                        self.copy_to_clipboard(text)
+                        self.notify(f"copied selection ({len(text)} chars)")
+                        event.stop()
+                        event.prevent_default()
+                        return
+                with contextlib.suppress(NoMatches):
+                    log_pane = panel.query_one(LogPane)
+                    if log_pane.has_selection:
+                        text = log_pane.get_selected_text()
+                        if text:
+                            self.copy_to_clipboard(text)
+                            self.notify(f"copied selection ({len(text)} chars)")
+                            event.stop()
+                            event.prevent_default()
+                            return
+            if (sel := self.screen.get_selected_text()):
+                self.copy_to_clipboard(sel)
+                self.notify(f"copied selection ({len(sel)} chars)")
+                event.stop()
+                event.prevent_default()
+        elif event.key.lower() == "escape":
+            cleared = False
+            if (panel := self.target()):
+                if panel.term.running and panel.term.has_selection:
+                    panel.term.clear_selection()
+                    cleared = True
+                with contextlib.suppress(NoMatches):
+                    log_pane = panel.query_one(LogPane)
+                    if log_pane.has_selection:
+                        log_pane.clear_selection()
+                        cleared = True
+            if self.screen.get_selected_text():
+                self.screen.clear_selection()
+                cleared = True
+            if cleared:
+                event.stop()
+                event.prevent_default()
 
     @work(group="quit")
     async def action_quit(self) -> None:  # type: ignore[override]

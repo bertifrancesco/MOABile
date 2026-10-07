@@ -150,13 +150,12 @@ gate does not let you through — there would be nothing past it to do.
 | `f` | **f**rida-server, on and off | `p` | **p**urge frida (device & client venvs) |
 | `s` | **s**pawn the app under frida, or attach | `k` | clear this panel's log |
 | `o` | explore the app with **o**bjection | `/` | filter log stream by keyword |
-| `w` | mirror the screen in a **w**indow | `c` | **c**opy log / text viewer modal |
+| `w` | mirror the screen in a **w**indow | `x` | wipe app data (without uninstall) |
 | `t` | **t**erminal on the device | `v` | save an s**v**g of the interface |
 | `l` | stream the device **l**og | `m` | dark/light **m**ode |
 | `d` | files: browse host ↔ device | `h` | **h**elp: keys and widgets |
-| `a` | **a**dd an app: install an apk or ipa | `x` | wipe app data (without uninstall) |
-| `e` | **e**xport the app's apk/ipa | `alt+c` | **c**opy terminal session / viewer |
-| `q`, `ctrl+q` | **q**uit | `f8` | return focus from tool pane |
+| `a` | **a**dd an app: install an apk or ipa | `f8` | return focus from tool pane |
+| `e` | **e**xport the app's apk/ipa | `q`, `ctrl+q` | **q**uit |
 
 `x` clears the selected app's user data, cache, and preferences without uninstalling it (`pm clear`
 on Android; on iOS it wipes the application data container, associated App Groups, and resets
@@ -164,7 +163,9 @@ on Android; on iOS it wipes the application data container, associated App Group
 
 `w` mirrors the screen in an external window (`scrcpy` on Android, `ioscpy` on iOS). On iOS,
 screen mirroring requires the `ioscpy` server tweak (`com.ioscpy.device`) from
-`https://lautarovculic.github.io/ioscpy-repo/` installed on the device.
+`https://lautarovculic.github.io/ioscpy-repo/` installed on the device. Note that iOS requires
+at least one initial physical tap on the iPhone touchscreen after connecting or respringing
+before mouse click and drag events can be injected by `ioscpy`.
 
 `s` spawns the app under frida, which is what a script that has to be in
 place before the app starts needs. Where the app is already running it offers
@@ -181,8 +182,9 @@ and Frida 16 on iOS within the same session. `p` purges frida-server and can wip
 client environments.
 
 On Android, MOABile automatically detects Google Play system updates to `com.google.android.art`
-that break Frida (issue [frida/frida#3639](https://github.com/frida/frida/issues/3639)), alerting
-the user and offering to uninstall the update and reboot.
+that break Frida (issues [frida/frida#2958](https://github.com/frida/frida/issues/2958) and
+[frida/frida#3639](https://github.com/frida/frida/issues/3639)), alerting the user and offering
+to uninstall the update and reboot.
 
 An app that is off screen is suspended on iOS, and attaching to a suspended
 process is a prompt that never arrives — so `s` and `o` bring the app to the
@@ -191,6 +193,35 @@ to do it by hand rather than left looking stuck, and `o` says so at once
 instead of watching a process table that is not going to change. Android needs
 none of this: a process there runs whether it is on screen or not.
 
+`o` prompts for optional startup parameters (such as
+`--startup-command "android sslpinning disable"`), with `Ctrl+O` opening an interactive file
+picker to select a local `--startup-script`. Parameters are validated and remembered per device
+panel.
+
+Text selection and clipboard integration are available across all panels:
+- **Copy on Select Everywhere**: Dragging the mouse highlights text and immediately copies
+  it to the system clipboard upon release with a toast confirmation — across device command
+  and event logs, terminal sessions, and modal text viewers.
+- **Interactive Terminal Scrolling (`t`, `s`, `o`)**: Scroll through terminal history with the
+  mouse wheel or `Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, and `Shift+End`. Any keypress
+  instantly snaps the viewport back to the active prompt.
+- **Smart Copy & Paste**: `Ctrl+C` copies selected text when a selection is active, or sends
+  `SIGINT` (`\x03`) to the process in terminal panes. `Ctrl+Shift+C` / `Shift+Ctrl+C` copies
+  active selection or screen/log content. In terminal panes, native bracketed paste
+  (`Shift+Ctrl+V`, `Cmd+V`, or middle-click) sends clipboard text directly into the running
+  session.
+
+Modal prompts (Frida arguments `s`, Objection startup parameters `o`, log keyword filters `/`,
+and custom Frida version installs) support terminal-style Readline command history:
+- **`↑` / `↓` Navigation**: Cycle backwards and forwards through session command history.
+- **Draft Preservation**: Typing partial input and pressing `↑` saves the draft in progress;
+  navigating `↓` back down restores the typed draft intact.
+- **Automatic Deduplication**: Repeating an earlier command moves it to the front without
+  duplicates.
+- **Strictly In-Memory**: Preserves the "Nothing is left behind" guarantee — history lives
+  only in RAM for the running session and is never written to disk. Passwords (`secret=True`)
+  are strictly excluded from history.
+
 The device log, `l`, is pinned to the app's pid rather than its name: `logcat`
 is asked for `--pid`, and on iOS `idevicesyslog` has no pid filter at all — its
 `-p` matches process *names*, and a process merely named something similar
@@ -198,8 +229,9 @@ comes with it — so the pid is applied here, on the bracket every syslog line
 carries after the process name. Which is why the whole-device-or-one-app
 question comes up only while the app is running: with no pid there is no
 filter to be had, so the stream is the whole device and the panel says why.
-`/` filters the active stream in real time by keyword, and `c` opens the
-accumulated log in a selectable viewer modal with native clipboard copy.
+`/` filters the active stream in real time by keyword. Mouse selection across
+log lines highlights and immediately copies the selected text to the clipboard,
+with drag auto-scroll allowing selection across the full buffer.
 
 Inside the file browser (`d`): `p` push host → device, `l` pull device → host, `a`
 jumps to the app's own data directory and `h` back to where the device side

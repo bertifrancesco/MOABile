@@ -30,6 +30,7 @@ from typing import Any, cast
 from unittest.mock import MagicMock, PropertyMock, patch
 
 from textual import events
+from textual.geometry import Size
 
 TMP = Path(tempfile.mkdtemp())
 
@@ -933,6 +934,7 @@ async def test_edge_cases() -> None:
     class FakeApp:
         def __init__(self) -> None:
             self.panels: list[object] = []
+            self.frida_version_history: list[str] = []
 
         def notify(self, *a: object, **kw: object) -> None: pass
         async def push_screen_wait(self, *a: object, **kw: object) -> object: return None
@@ -976,7 +978,7 @@ async def test_edge_cases() -> None:
     assert await dp.frida_blocker() is None
     assert dp.summary() == ""
     assert dp.cpu == "?"
-    assert moabile.VERSION == "1.2.0"
+    assert moabile.VERSION == "1.3.0"
 
     # Log filter edge cases: case-insensitivity, history retention, regex escaping
     dp.log_history.clear()
@@ -1001,6 +1003,11 @@ async def test_edge_cases() -> None:
     # TerminalPane pause on exit
     tp = moabile.TerminalPane(dp)
     assert tp.exited is None
+    assert tp.max_history_offset == 0
+    assert tp.get_visible_rows() == []
+    assert tp.get_selected_text() == ""
+    tp.scroll_up()
+    tp.scroll_down()
     tp.exited = 1
     tp.on_key(events.Key("enter", "enter"))
     assert tp.exited is None
@@ -1020,6 +1027,8 @@ async def test_edge_cases() -> None:
 
     # 7. DevicePanel ensure_frida error branches
     dp.frida_pid = lambda: _async_none()
+    dp.frida_blocker = lambda: _async_str("frida-server needs root")
+    assert await dp.ensure_frida() is False
     dp.frida_blocker = lambda: _async_none()
     sh_orig = moabile.sh
     moabile.sh = lambda *a, **kw: _async_tuple((0, "no version")) if a[0] == "frida" else sh_orig(*a, **kw)
@@ -1665,13 +1674,19 @@ async def test_edge_cases() -> None:
 
     async def fake_art_adb(*args: object, **kw: object) -> tuple[int, str]:
         adb_art_cmds.append(args)
-        if "list" in args:
-            return 0, "package:com.google.android.art"
+        if any("com.google.android.art" in str(a) for a in args) and "uninstall" not in str(args):
+            return 0, "package:/data/apex/active/com.google.android.art@341511000.apex"
         if args == ("shell", "pm", "uninstall", "com.google.android.art"):
             return 1, "Failure [DELETE_FAILED_INTERNAL_ERROR]"
         if "su" in args and "pm uninstall" in str(args):
             return 0, "Success"
         return 0, ""
+
+    # detect_art_update branches
+    ap.adb = lambda *a, **kw: _async_tuple((1, "error"))
+    assert await ap.detect_art_update() is False
+    ap.adb = lambda *a, **kw: _async_tuple((0, "package:com.google.android.art"))
+    assert await ap.detect_art_update() is True
 
     ap.adb = fake_art_adb
     ap.mob.push_screen_wait = lambda s: _async_bool(True)
@@ -1938,20 +1953,17 @@ async def test_edge_cases() -> None:
     sym_deb.unlink(missing_ok=True)
     shutil.rmtree(Path(TMP) / "sym_out", ignore_errors=True)
 
-    # TerminalPane on_click, _pause_on_exit, and key c
+    # TerminalPane _pause_on_exit and dismiss on key press
     tp = moabile.TerminalPane(dp)
-    tp.proc = type("Proc", (), {"pid": 1234, "poll": lambda s: None, "wait": lambda s, timeout=None: None})()
-    tp.action_copy_terminal = lambda: setattr(tp, "_copied", True)
-    click_evt = events.Click(None, 0, 0, 0, 0, 1, False, False, False)
-    tp.on_click(click_evt)
-    assert getattr(tp, "_copied", False) is True
-
+    tp.proc = type(
+        "Proc", (), {"pid": 1234, "poll": lambda s: None, "wait": lambda s, timeout=None: None}
+    )()
     tp._pause_on_exit(1)
     assert tp.exited == 1
-    key_c = events.Key("c", "c")
+    key_dismiss = events.Key("enter", "enter")
     with patch.object(moabile.TerminalPane, "app", app_cli), \
          patch.object(app_cli, "push_screen"):
-        tp.on_key(key_c)
+        tp.on_key(key_dismiss)
 
     # MOABile copy_to_clipboard and _clipboard_via
     app_cli._clipboard_via(["cat"], "clipboard text")
@@ -2046,15 +2058,12 @@ async def test_edge_cases() -> None:
     await moabile.MOABile.action_frida_purge.__wrapped__(app_cli)
     assert not fake_v_purge.exists()
 
-    # MOABile action_copy_terminal and action_leave_terminal
+    # MOABile action_leave_terminal
     tp_test = moabile.TerminalPane(dp)
     tp_test.action_leave = lambda: setattr(tp_test, "_left", True)
-    tp_test.action_copy_terminal = lambda: setattr(tp_test, "_copied", True)
     with patch.object(moabile.MOABile, "focused", tp_test):
-        app_cli.action_copy_terminal()
         app_cli.action_leave_terminal()
     assert getattr(tp_test, "_left", False) is True
-    assert getattr(tp_test, "_copied", False) is True
 
     # MOABile action_frida_client & action_objection without package
     app_cli.target = lambda: dp
@@ -2133,6 +2142,13 @@ async def test_edge_cases() -> None:
     fs_test.notify = lambda *a, **kw: None
     with patch.object(moabile.FilesScreen, "focused", new_callable=PropertyMock, return_value=None):
         assert fs_test.focused_side() is None
+
+    # FilesScreen.action_reload
+    fs_test.action_reload()
+
+    # FilesScreen.action_app_dir when package is empty
+    dp.package = ""
+    await fs_test.action_app_dir.__wrapped__(fs_test)
 
     # FilesScreen.action_app_dir when data_dir is empty
     dp.package = "com.test"
@@ -2463,48 +2479,21 @@ async def test_edge_cases() -> None:
         await app_cli._mirror_worker(ios_panel)
         assert ios_panel.mirror is None
 
-    # MOABile.action_text_viewer with running terminal, last terminal output, and empty
-    tp_live = moabile.TerminalPane(dp)
-    tp_live.exited = 0
-    tp_live.command = "sh"
-    tp_live.vt = object()
-    tp_live.get_history_text = lambda: "history line 1\nhistory line 2"
-    orig_query_one = dp.query_one
-    dp.query_one = lambda cls: tp_live if cls is moabile.TerminalPane else orig_query_one(cls)
-    dp.log_history = ["log line 1"]
-    psw_calls = 0
-
-    async def track_psw(s: object) -> object:
-        nonlocal psw_calls
-        psw_calls += 1
-        return None
-
-    app_cli.push_screen_wait = track_psw
-    with patch.object(app_cli, "target", return_value=dp):
-        await app_cli.action_text_viewer.__wrapped__(app_cli)
-        assert psw_calls == 1
-
-    dp.log_history = []
-    dp.last_terminal_output = "previous session log"
-    tp_live.exited = None
-    tp_live.proc = None
-    with patch.object(app_cli, "target", return_value=dp):
-        await app_cli.action_text_viewer.__wrapped__(app_cli)
-        assert psw_calls == 2
-
-    dp.last_terminal_output = None
-    with patch.object(app_cli, "target", return_value=dp):
-        await app_cli.action_text_viewer.__wrapped__(app_cli)
-        assert psw_calls == 3
-    dp.query_one = orig_query_one
-
-    # MOABile.action_save_app with no target
+    # MOABile actions with no target
     with patch.object(app_cli, "target", return_value=None):
+        await app_cli.action_filter_logs.__wrapped__(app_cli)
+        await app_cli.action_install.__wrapped__(app_cli)
+        await app_cli.action_save_app.__wrapped__(app_cli)
+
+    # MOABile.action_save_app with no package
+    with patch.object(app_cli, "target", return_value=dp):
+        dp.package = ""
         await app_cli.action_save_app.__wrapped__(app_cli)
 
     # MOABile.action_quit with panels shutting down
     p_quit_mock = StubPanel("quit-mock", app_cli)
-    p_quit_mock.query_one = lambda cls: tp_live  # type: ignore[assignment]
+    tp_quit = moabile.TerminalPane(p_quit_mock)
+    p_quit_mock.query_one = lambda cls: tp_quit  # type: ignore[assignment]
     p_quit_mock.shutdown = lambda: _async_none()  # type: ignore[assignment]
     app_cli.push_screen_wait = lambda s: _async_bool(True)
     with patch.object(moabile.MOABile, "panels", new_callable=lambda: property(lambda s: [p_quit_mock])), \
@@ -2957,6 +2946,89 @@ async def phase_keys(app, pilot) -> None:
         await pilot.pause()
     print("PASS every modal stays a bordered popup, never a full-screen page")
 
+    # Modal history navigation: up/down arrows, draft preservation, deduplication
+    hist: list[str] = ["cmd1", "cmd2"]
+    ask = moabile.AskScreen("history test", "", history=hist)
+    app.push_screen(ask)
+    assert await settle(pilot, lambda: bool(ask.query("#answer")))
+    ans = ask.query_one("#answer", Input)
+
+    # Empty and None history edge cases
+    ask_empty = moabile.AskScreen("empty hist", "", history=[])
+    ask_empty.action_history_prev()
+    ask_empty.action_history_next()
+    ask_none = moabile.AskScreen("none hist", "", history=None)
+    ask_none.action_history_prev()
+    ask_none.action_history_next()
+
+    # Initial state: pressing down at bottom does nothing
+    ask.action_history_next()
+    assert ans.value == ""
+
+    # User types a draft, then presses up
+    ans.value = "my draft"
+    await pilot.press("up")
+    assert ans.value == "cmd2"
+
+    await pilot.press("up")
+    assert ans.value == "cmd1"
+
+    # Up at top stays at top
+    await pilot.press("up")
+    assert ans.value == "cmd1"
+
+    # Down navigates forward
+    await pilot.press("down")
+    assert ans.value == "cmd2"
+
+    # Down past newest restores the typed draft
+    await pilot.press("down")
+    assert ans.value == "my draft"
+
+    # Down past draft stays at draft
+    await pilot.press("down")
+    assert ans.value == "my draft"
+
+    # Submit deduplicates existing entry and moves to end
+    ans.value = "cmd1"
+    await pilot.press("enter")
+    assert hist == ["cmd2", "cmd1"]
+
+    # Prefilled value matching last entry
+    ask_match = moabile.AskScreen("match", "cmd1", history=hist)
+    app.push_screen(ask_match)
+    assert await settle(pilot, lambda: bool(ask_match.query("#answer")))
+    ans_match = ask_match.query_one("#answer", Input)
+    await pilot.press("up")
+    assert ans_match.value == "cmd2"
+    await pilot.press("down")
+    assert ans_match.value == "cmd1"
+    # Editing prefilled value preserves modified draft
+    ans_match.value = "draft_mod"
+    await pilot.press("up")
+    assert ans_match.value == "cmd1"
+    await pilot.press("down")
+    assert ans_match.value == "draft_mod"
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.AskScreen))
+
+    # Secret screen does not record history
+    ask_secret = moabile.AskScreen("secret", "pw", secret=True, history=hist)
+    app.push_screen(ask_secret)
+    assert await settle(pilot, lambda: bool(ask_secret.query("#answer")))
+    ask_secret.query_one("#answer", Input).value = "new_secret"
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.AskScreen))
+    assert "new_secret" not in hist
+
+    # Empty input does not add to history
+    ask_empty_in = moabile.AskScreen("empty in", "", history=hist)
+    app.push_screen(ask_empty_in)
+    assert await settle(pilot, lambda: bool(ask_empty_in.query("#answer")))
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.AskScreen))
+    print("PASS modal history navigation restores drafts and deduplicates entries")
+
 
 async def phase_tools(app, pilot) -> None:
     """the embedded terminal, objection and frida-client."""
@@ -2985,8 +3057,8 @@ async def phase_tools(app, pilot) -> None:
     assert b.term.running and b.has_class("running"), "pane closed instead of pausing on exit!=0"
     assert "exited with code 2" in b.term.border_subtitle, b.term.border_subtitle
     assert "fatal failure" in term_text(b), term_text(b)
-    # c copies the error output and opens TextViewerScreen
-    await pilot.press("c")
+    # ctrl+c copies the error output and opens TextViewerScreen
+    await pilot.press("ctrl+c")
     assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
     assert "fatal failure" in app._clipboard
     await pilot.press("escape")
@@ -3003,7 +3075,8 @@ async def phase_tools(app, pilot) -> None:
     # The log is the panel and a tool opens under it: what was run stays
     # readable while the REPL is up, instead of scrolling away behind it.
     order = [type(child).__name__ for child in b.children]
-    assert order.index("RichLog") < order.index("TerminalPane"), order
+    log_name = "LogPane" if "LogPane" in order else "RichLog"
+    assert order.index(log_name) < order.index("TerminalPane"), order
     b.term.start(["sh", "-c", "echo both; sleep 20"])
     assert await settle(pilot, lambda: b.has_class("running")), b.has_class("running")
     assert b.term.region.height and b.query_one(RichLog).region.height, \
@@ -3012,26 +3085,197 @@ async def phase_tools(app, pilot) -> None:
     await pilot.pause()
     print("PASS the log stays visible under a running tool")
 
-    # alt+c copies running terminal session without stopping the process
+    # Running terminal session
     b.term.start(["sh", "-c", "echo 'active terminal session'; sleep 20"])
     assert await settle(pilot, lambda: "active terminal session" in term_text(b)), term_text(b)
-    await pilot.press("alt+c")
-    assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
-    assert "active terminal session" in app._clipboard
-    await pilot.press("escape")
-    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), \
-        app.screen
-    assert b.term.running, "alt+c stopped the running terminal"
+    assert b.term.running
     # Scrollback history retains lines that scrolled off the visible screen
     for i in range(50):
         b.term.stream.feed(f"scrollback line {i}\r\n".encode())
     history = b.term.get_history_text()
     assert "scrollback line 0" in history and "scrollback line 49" in history, history
+
+    # Interactive scrolling in terminal pane
+    assert b.term.history_offset == 0
+    b.term.scroll_up(10)
+    assert b.term.history_offset == 10
+    assert "scroll -10" in b.term.border_subtitle
+    b.term.scroll_down(4)
+    assert b.term.history_offset == 6
+    # Keyboard scrolling
+    await pilot.press("shift+home")
+    assert b.term.history_offset == len(b.term.vt.history.top)
+    await pilot.press("shift+end")
+    assert b.term.history_offset == 0
+    await pilot.press("shift+pageup")
+    assert b.term.history_offset > 0
+    await pilot.press("shift+pagedown")
+    # Mouse scroll events
+    b.term.on_mouse_scroll_up(events.MouseScrollUp(None, 0, 0, 0, 0, 1, False, False, False))
+    b.term.on_mouse_scroll_down(events.MouseScrollDown(None, 0, 0, 0, 0, 1, False, False, False))
+    # Any normal key typing resets history offset
+    b.term.history_offset = 5
+    await pilot.press("x")
+    assert b.term.history_offset == 0
+
+    # Non-selecting mouse move and mouse up return early
+    b.term.on_mouse_move(events.MouseMove(None, 0, 0, 0, 0, 1, False, False, False))
+    b.term.on_mouse_up(events.MouseUp(None, 0, 0, 0, 0, 1, False, False, False))
+
+    # Mouse selection & copy-on-select
+    b.term.on_mouse_down(events.MouseDown(None, 1, 1, 0, 0, 2, False, False, False))
+    b.term.on_mouse_down(events.MouseDown(None, 1, -1, 0, 0, 1, False, False, False))
+    b.term.on_mouse_down(
+        events.MouseDown(None, 1, b.term.size.height, 0, 0, 1, False, False, False)
+    )
+    b.term.on_mouse_down(events.MouseDown(None, 2, 2, 0, 0, 1, False, False, False))
+    b.term.on_mouse_move(events.MouseMove(None, 10, 2, 0, 0, 1, False, False, False))
+    b.term.on_mouse_up(events.MouseUp(None, 10, 2, 0, 0, 1, False, False, False))
+    assert b.term.has_selection is True
+    sel_text = b.term.get_selected_text()
+    assert sel_text != ""
+
+    # Zero-span click clears selection
+    b.term.on_mouse_down(events.MouseDown(None, 2, 2, 0, 0, 1, False, False, False))
+    b.term.on_mouse_up(events.MouseUp(None, 2, 2, 0, 0, 1, False, False, False))
+    assert b.term.has_selection is False
+
+    # clear_selection while selecting releases mouse
+    b.term._selecting = True
+    b.term.clear_selection()
+    assert b.term._selecting is False
+
+    # Backwards / multi-line selection rendering and clamping
+    b.term.selection_start = (10, 2)
+    b.term.selection_end = (2, 0)
+    assert b.term.has_selection is True
+    assert b.term.get_selected_text() != ""
+    b.term.render()
+
+    b.term.selection_start = (2, 0)
+    b.term.selection_end = (10, 2)
+    b.term.render()
+
+    cur_start = b.term.current_history_start
+    b.term.selection_start = (2, cur_start)
+    b.term.selection_end = (10, cur_start + 2)
+    b.term.render()
+
+    b.term.selection_end = (0, 9999)
+    assert b.term.get_selected_text() != ""
+
+    # Escape clears selection
+    b.term.selection_start = (0, 0)
+    b.term.selection_end = (5, 0)
+    await pilot.press("escape")
+    assert b.term.has_selection is False
+
+    # Key press clears active selection
+    b.term.selection_start = (0, 0)
+    b.term.selection_end = (5, 0)
+    await pilot.press("y")
+    assert b.term.has_selection is False
+
+    # Smart ctrl+c copies selection and clears it
+    b.term.selection_start = (0, 0)
+    b.term.selection_end = (10, 0)
+    sel_text = b.term.get_selected_text()
+    app._clipboard = ""
+    await pilot.press("ctrl+c")
+    assert app._clipboard == sel_text
+    assert b.term.has_selection is False
+
+    # Border subtitle states
+    b.term.exited = 1
+    b.term._update_border_subtitle()
+    assert "exited with code 1" in b.term.border_subtitle
+    b.term.exited = None
+    b.term.selection_start = (0, 0)
+    b.term.selection_end = (5, 0)
+    b.term._update_border_subtitle()
+    assert "copied selection" in b.term.border_subtitle
+    b.term.clear_selection()
+
+    # Empty vt edge cases
+    empty_term = moabile.TerminalPane(type("Dummy", (), {"uid": "dummy"})())
+    assert empty_term.get_visible_rows() == []
+    assert empty_term.get_all_rows() == []
+    assert empty_term.current_history_start == 0
+    assert empty_term.get_history_text() == ""
+    empty_term.scroll_up()
+    empty_term.scroll_down()
+    empty_term._update_border_subtitle()
+    assert empty_term.border_subtitle == ""
+
+    # ctrl+shift+c copies text
+    app._clipboard = ""
+    await pilot.press("ctrl+shift+c")
+    assert app._clipboard != ""
+
+    # Paste
+    b.term.history_offset = 5
+    b.term.on_paste(events.Paste("echo pasted\n"))
+    assert b.term.history_offset == 0
+    saved_fd = b.term.fd
+    b.term.fd = None
+    b.term.on_paste(events.Paste("echo pasted\n"))
+    b.term.fd = saved_fd
+
+    # TerminalPane selection with auto-scroll and global key shortcuts while running
+    b.term._selecting = True
+    b.term.selection_start = (0, 0)
+    b.term.selection_end = (5, 0)
+    assert b.term.has_selection
+    assert b.term.selection_bounds == (0, 0, 5, 0)
+    b.term.on_mouse_move(events.MouseMove(b.term, x=5, y=-2, delta_x=0, delta_y=0, button=1,
+                                          ctrl=False, meta=False, shift=False,
+                                          screen_x=5, screen_y=-2))
+    rows = len(b.term.get_visible_rows())
+    b.term.on_mouse_move(events.MouseMove(b.term, x=5, y=rows + 5, delta_x=0, delta_y=0,
+                                          button=1, ctrl=False, meta=False, shift=False,
+                                          screen_x=5, screen_y=rows + 5))
+    b.term.on_mouse_scroll_up(events.MouseScrollUp(b.term, x=5, y=0, delta_x=0, delta_y=0,
+                                                   button=1, shift=False, meta=False, ctrl=False))
+    b.term.on_mouse_scroll_down(events.MouseScrollDown(b.term, x=5, y=0, delta_x=0, delta_y=0,
+                                                       button=1, shift=False, meta=False,
+                                                       ctrl=False))
+    b.term.clear_selection()
+
+    cur_start = b.term.current_history_start
+    b.term.selection_start = (0, cur_start)
+    b.term.selection_end = (5, cur_start)
+    t_rendered = b.term.render()
+    assert any(s.style and s.style.reverse for s in t_rendered.spans)
+    app.on_key(events.Key("ctrl+shift+c", "ctrl+shift+c"))
+    b.term.selection_start = (0, cur_start)
+    b.term.selection_end = (5, cur_start)
+    app.on_key(events.Key("ctrl+c", "ctrl+c"))
+    b.term.selection_start = (0, cur_start)
+    b.term.selection_end = (5, cur_start)
+    app.on_key(events.Key("escape", "escape"))
+    assert not b.term.has_selection
+
+    b.term.on_mouse_down(events.MouseDown(b.term, x=2, y=0, delta_x=0, delta_y=0, button=1,
+                                          shift=False, meta=False, ctrl=False))
+    b.term.on_mouse_up(events.MouseUp(b.term, x=2, y=0, delta_x=0, delta_y=0, button=1,
+                                      shift=False, meta=False, ctrl=False))
+    assert not b.term.has_selection
+
+    # Click at top-left content cell (x=1, y=1) maps to (0, 0) with zero offset
+    b.term.on_mouse_down(events.MouseDown(b.term, x=1, y=1, delta_x=0, delta_y=0, button=1,
+                                          shift=False, meta=False, ctrl=False))
+    assert b.term.selection_start == (0, b.term.current_history_start)
+    b.term.on_mouse_up(events.MouseUp(b.term, x=1, y=1, delta_x=0, delta_y=0, button=1,
+                                      shift=False, meta=False, ctrl=False))
+    assert not b.term.has_selection
+
     b.term.stop()
     await pilot.pause()
-    print("PASS alt+c copies running terminal session and scrollback retains lines")
+    print("PASS terminal copy-on-select, smart clipboard and scrollback retain lines")
 
     app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("enter")
     await confirm(pilot, app, "y")
     assert await settle(pilot, lambda: b.term.argv[:1] == ["objection"], tries=300), b.term.argv
     assert (TMP / "monkey").exists(), "app was never started before attaching"
@@ -3054,12 +3298,66 @@ async def phase_tools(app, pilot) -> None:
     # seconds: nothing here can start it, so there is nothing to wait for.
     began = time.monotonic()
     app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("enter")
     assert await settle(pilot, lambda: "cannot be started from here" in log_text(b),
                         tries=200), log_text(b)
     assert time.monotonic() - began < 5, "waited for a launch that was never asked for"
     (TMP / "nolauncher").unlink()
     (TMP / f"running-{b.serial}").touch()
     print("PASS an app with no launcher activity says so, rather than not starting")
+
+    # objection startup command and script arguments
+    b.term.stop()
+    await pilot.pause()
+    test_obj_script = TMP / "obj_hook.js"
+    test_obj_script.write_text("// obj hook")
+    b.script_dir = str(TMP)
+
+    app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("ctrl+o")
+    assert await on_screen(pilot, app, moabile.ScriptScreen)
+    obj_picker = app.screen
+    obj_entries = obj_picker.side.query_one(ListView)
+    select(obj_entries, "obj_hook.js")
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    obj_in = app.screen.query_one("#answer", Input)
+    assert "--startup-script" in obj_in.value
+    obj_in.value = f'{obj_in.value} --startup-command "android sslpinning disable"'
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: b.term.argv[:1] == ["objection"], tries=300), b.term.argv
+    assert "--startup-command" in b.term.argv and "android sslpinning disable" in b.term.argv
+    assert "--startup-script" in b.term.argv and str(test_obj_script) in b.term.argv
+    b.term.stop()
+    await pilot.pause()
+
+    # objection unparsable arguments rejected
+    app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    app.screen.query_one("#answer", Input).value = 'a "unbalanced'
+    await pilot.press("enter")
+    assert await settle(pilot, lambda: "bad objection arguments" in log_text(b))
+
+    # objection args cancelled on escape and history recalled
+    app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("up")
+    assert "--startup-command" in app.screen.query_one("#answer", Input).value
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.ObjectionArgsScreen))
+    print("PASS objection accepts startup parameters and rejects bad arguments")
+
+    # Package list responsive layout: height is auto and does not overflow apps box
+    assert "#packages {" in moabile.MOABile.CSS
+    assert "scrollbar-size-vertical: 1;" in moabile.MOABile.CSS
+    pkgs_lv = app.query_one("#packages")
+    apps_box = app.query_one("#apps")
+    assert pkgs_lv.region.bottom <= apps_box.region.bottom
+    app.on_resize(events.Resize(Size(80, 14), Size(80, 14)))
+    assert pkgs_lv.styles.max_height.value is not None and pkgs_lv.styles.max_height.value <= 4
+    app.on_resize(events.Resize(app.size, app.size))
+    print("PASS package list does not overflow on small screen heights")
 
     (TMP / "frida-up").touch()
     app.action_frida_client()
@@ -3070,6 +3368,15 @@ async def phase_tools(app, pilot) -> None:
     await pilot.press("enter")
     assert await settle(pilot, lambda: "bad frida arguments" in log_text(b))
     print("PASS frida-client rejects unparsable arguments")
+
+    # frida args history recalled
+    app.action_frida_client()
+    await confirm(pilot, app, "n")
+    assert await on_screen(pilot, app, moabile.FridaArgsScreen)
+    await pilot.press("up")
+    assert app.screen.query_one("#answer", Input).value == 'a "unbalanced'
+    await pilot.press("escape")
+    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.FridaArgsScreen))
 
     # The spawn is deferred a frame, so a second press used to start a second
     # process and orphan the first, whose pty nobody would ever close.
@@ -3121,7 +3428,6 @@ async def phase_tools(app, pilot) -> None:
     assert app.query_one("#barkey-b").display is False
     assert app.query_one("#barkey-h").display is False
     assert app.check_action("quit", ()) is False
-    assert app.check_action("copy_terminal", ()) is True
     assert app.check_action("leave_terminal", ()) is True
     await pilot.press("f8")
     assert await settle(pilot, lambda: b.has_focus), app.focused
@@ -3490,6 +3796,7 @@ async def phase_streams(app, pilot) -> None:
     await pilot.press("enter")
     assert b.log_filter == ""
     assert "/error" not in _stats(b), _stats(b)
+    assert app.filter_history == ["error"]
     # Focusing sidebar package filter disables / filter_logs hotkey
     pkg_input = app.query_one("#filter", Input)
     pkg_input.focus()
@@ -3505,26 +3812,199 @@ async def phase_streams(app, pilot) -> None:
     assert app.check_action("quit", ()) is not False
     print("PASS / filters log stream by keyword and shows badge in stats")
 
-    # c opens log history in selectable read-only TextViewer modal
-    await pilot.press("c")
+    # TextViewerScreen modal is selectable and read-only
+    app.push_screen(moabile.TextViewerScreen("Log viewer", "line two error occurred"))
     assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
     area = app.screen.query_one(moabile.TextArea)
     assert area.read_only is True
     assert "line two error occurred" in area.text, area.text
-    # c in TextViewerScreen copies to clipboard
-    await pilot.press("c")
+    # ctrl+c in TextViewerScreen copies to clipboard
+    await pilot.press("ctrl+c")
     assert "line two error occurred" in app._clipboard
+    # mouse up in TextViewerScreen with selection copies to clipboard
+    from textual.widgets.text_area import Selection as TextAreaSelection
+    area.selection = TextAreaSelection(start=(0, 0), end=(0, 8))
+    app.screen.on_mouse_up(events.MouseUp(None, 0, 0, 0, 0, 1, False, False, False))
+    assert app._clipboard == area.selected_text
     # ctrl+a selects all text
     await pilot.press("ctrl+a")
     assert area.selected_text == area.text
     await pilot.press("escape")
-    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), app.screen
+    assert await settle(
+        pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)
+    ), app.screen
     # q also closes TextViewerScreen
-    await pilot.press("c")
+    app.push_screen(moabile.TextViewerScreen("Log viewer", "line two error occurred"))
     assert await on_screen(pilot, app, moabile.TextViewerScreen, tries=200), app.screen
     await pilot.press("q")
-    assert await settle(pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)), app.screen
-    print("PASS c opens log history in selectable read-only TextViewer modal and copies to clipboard")
+    assert await settle(
+        pilot, lambda: not isinstance(app.screen, moabile.TextViewerScreen)
+    ), app.screen
+    print("PASS TextViewerScreen modal copies to clipboard and dismisses")
+
+    # LogPane text selection and copy-on-select across panels with auto-scrolling
+    lp = b.query_one(moabile.LogPane)
+    rendered_strip = lp.render_line(0)
+    assert rendered_strip is not None
+
+    # Test highlight_strip helper directly on edge cases
+    from rich.segment import Segment
+    raw_strip = moabile.Strip([Segment("test snippet for selection")])
+    assert moabile.highlight_strip(raw_strip, 0, 0).text == "test snippet for selection"
+    assert moabile.highlight_strip(raw_strip, 5, 2).text == "test snippet for selection"
+    assert moabile.highlight_strip(raw_strip, 0, 26).text == "test snippet for selection"
+    assert moabile.highlight_strip(raw_strip, 5, 12).text == "test snippet for selection"
+    assert moabile.highlight_strip(moabile.Strip.blank(0), 0, 5).text == ""
+    short_strip = moabile.Strip([Segment("abc")])
+    assert moabile.highlight_strip(short_strip, 5, 8).text == "abc"
+
+    # Selection on LogPane and edge cases
+    lp.clear_selection()
+    assert lp.selection_bounds is None
+    assert lp.get_selected_text() == ""
+    empty_lp = moabile.LogPane()
+    empty_lp.selection_start = (0, 0)
+    empty_lp.selection_end = (5, 0)
+    assert empty_lp.get_selected_text() == ""
+
+    # Reverse selection & multi-line rendering on LogPane
+    lp.selection_start = (5, 2)
+    lp.selection_end = (2, 0)
+    assert lp.selection_bounds == (2, 0, 5, 2)
+
+    lp.selection_start = (0, 5)
+    lp.selection_end = (5, 5)
+    assert lp.render_line(0) is not None
+
+    lp.write("extra line for multi-line extraction\nand another line\n")
+    lp.selection_start = (2, 0)
+    lp.selection_end = (4, 2)
+    assert lp.render_line(0) is not None
+    assert lp.render_line(1) is not None
+    assert lp.render_line(2) is not None
+    assert lp.get_selected_text() != ""
+
+    lp.selection_start = (0, 0)
+    lp.selection_end = (5, 0)
+    assert lp.has_selection
+    assert lp.selection_bounds == (0, 0, 5, 0)
+    hl_strip = lp.render_line(0)
+    assert hl_strip is not None
+    extracted = lp.get_selected_text()
+    assert len(extracted) > 0
+    lp._selecting = True
+    lp.clear_selection()
+    assert not lp.has_selection
+    assert not lp._selecting
+
+    # Mouse events when not selecting, and invalid buttons / bounds
+    lp._selecting = False
+    lp.on_mouse_move(events.MouseMove(lp, x=0, y=0, delta_x=0, delta_y=0, button=1,
+                                      ctrl=False, meta=False, shift=False))
+    lp.on_mouse_up(events.MouseUp(lp, x=0, y=0, delta_x=0, delta_y=0, button=1,
+                                  shift=False, meta=False, ctrl=False))
+    lp.on_mouse_down(events.MouseDown(lp, x=0, y=0, delta_x=0, delta_y=0, button=2,
+                                      shift=False, meta=False, ctrl=False))
+    lp.on_mouse_down(events.MouseDown(lp, x=0, y=-1, delta_x=0, delta_y=0, button=1,
+                                      shift=False, meta=False, ctrl=False))
+    lp.on_mouse_down(events.MouseDown(lp, x=0, y=lp.size.height + 10, delta_x=0, delta_y=0,
+                                      button=1, shift=False, meta=False, ctrl=False))
+
+    # Mouse click with zero span (start == end)
+    lp.on_mouse_down(events.MouseDown(lp, x=2, y=0, delta_x=0, delta_y=0, button=1,
+                                      shift=False, meta=False, ctrl=False))
+    lp.on_mouse_up(events.MouseUp(lp, x=2, y=0, delta_x=0, delta_y=0, button=1,
+                                  shift=False, meta=False, ctrl=False))
+    assert lp.selection_start is None
+
+    # Mouse events on LogPane: down, drag with scroll up/down, up
+    lp.on_mouse_down(events.MouseDown(lp, x=0, y=0, delta_x=0, delta_y=0, button=1,
+                                      shift=False, meta=False, ctrl=False))
+    assert lp._selecting
+    lp.on_mouse_move(events.MouseMove(lp, x=5, y=-2, delta_x=0, delta_y=0, button=1,
+                                      ctrl=False, meta=False, shift=False, screen_x=5, screen_y=-2))
+    lp.on_mouse_move(events.MouseMove(lp, x=5, y=50, delta_x=0, delta_y=0, button=1,
+                                      ctrl=False, meta=False, shift=False, screen_x=5, screen_y=50))
+    lp.on_mouse_scroll_up(events.MouseScrollUp(lp, x=5, y=0, delta_x=0, delta_y=0,
+                                               button=1, shift=False, meta=False, ctrl=False))
+    lp.on_mouse_scroll_down(events.MouseScrollDown(lp, x=5, y=0, delta_x=0, delta_y=0,
+                                                   button=1, shift=False, meta=False, ctrl=False))
+    lp.on_mouse_up(events.MouseUp(lp, x=8, y=0, delta_x=0, delta_y=0, button=1,
+                                  shift=False, meta=False, ctrl=False))
+    assert not lp._selecting
+
+    # Escape key clears LogPane selection
+    lp.selection_start = (0, 0)
+    lp.selection_end = (5, 0)
+    lp.on_key(events.Key("escape", "escape"))
+    assert not lp.has_selection
+
+    # Responsive layout adjustment test
+    app._update_layout_responsiveness()
+    orig_w = app.size.width
+    app._size = Size(70, 20)
+    app._update_layout_responsiveness()
+    assert app.query_one("#side", moabile.Vertical).styles.width.value <= 34
+    assert app.query_one("#packages", moabile.ListView).styles.max_height.value <= 12
+    app._size = Size(orig_w, 24)
+    app._update_layout_responsiveness()
+    assert app.query_one("#packages", moabile.ListView).styles.max_height.value == 12
+    print("PASS log and terminal copy-on-select with auto-scroll and responsive layout")
+
+    # MOABile global text selected event and key shortcuts
+    saved_cb = app._clipboard
+
+    # Keys with LogPane selection
+    lp.selection_start = (0, 0)
+    lp.selection_end = (5, 0)
+    app.on_key(events.Key("ctrl+shift+c", "ctrl+shift+c"))
+    lp.selection_start = (0, 0)
+    lp.selection_end = (5, 0)
+    app.on_key(events.Key("ctrl+c", "ctrl+c"))
+    lp.selection_start = (0, 0)
+    lp.selection_end = (5, 0)
+    app.on_key(events.Key("escape", "escape"))
+    assert not lp.has_selection
+
+    app.screen.get_selected_text = lambda: "selected panel text"
+    app.on_text_selected(events.TextSelected())
+    assert app._clipboard == "selected panel text"
+    app.on_key(events.Key("ctrl+c", "ctrl+c"))
+    assert app._clipboard == "selected panel text"
+    app.on_key(events.Key("ctrl+shift+c", "ctrl+shift+c"))
+    assert app._clipboard == "selected panel text"
+    app.screen.get_selected_text = lambda: None
+    app.on_key(events.Key("ctrl+shift+c", "ctrl+shift+c"))
+    assert "line two error occurred" in app._clipboard
+
+    # Escape clears active text selection
+    app.screen.get_selected_text = lambda: "active"
+    cleared = []
+    app.screen.clear_selection = lambda: cleared.append(True)
+    app.on_key(events.Key("escape", "escape"))
+    assert cleared == [True]
+    del app.screen.get_selected_text
+    del app.screen.clear_selection
+    app._clipboard = saved_cb
+
+    # MOABile on_mouse_up with TextArea selection
+    from textual.widgets import TextArea
+    mock_ta = TextArea("sample text")
+    mock_ta.select_all()
+    with patch.object(
+        moabile.MOABile, "focused", new_callable=PropertyMock, return_value=mock_ta
+    ):
+        app.on_mouse_up(events.MouseUp(None, 0, 0, 0, 0, 1, False, False, False))
+        assert app._clipboard == "sample text"
+    app._clipboard = saved_cb
+
+    # ScreenStackError handling in check_action, on_key, on_mouse_up, _update_barkey_visibility
+    with patch.object(moabile.MOABile, "focused", new_callable=PropertyMock) as mock_foc:
+        mock_foc.side_effect = moabile.ScreenStackError("no screens")
+        app.check_action("leave_terminal", ())
+        app.on_key(events.Key("ctrl+c", "ctrl+c"))
+        app.on_mouse_up(events.MouseUp(None, 0, 0, 0, 0, 1, False, False, False))
+        app._update_barkey_visibility()
 
     # logcat is asked for whole or filtered every time it starts: a filter is
     # invisible once the stream is scrolling.
@@ -4712,6 +5192,7 @@ async def phase_ios(app, pilot) -> None:
     assert await settle(pilot, lambda: ios.mirror is not None), log_text(ios)
     window = ios.mirror
     assert "ioscpy" in log_text(ios), log_text(ios)
+    assert "tap the iPhone screen once" in log_text(ios), log_text(ios)
     app.action_mirror()
     assert await settle(pilot, lambda: ios.mirror is None), log_text(ios)
     assert window is not None and window.returncode is not None, "the ioscpy window was left unreaped"
@@ -4801,6 +5282,8 @@ async def phase_ios(app, pilot) -> None:
     # frida client had spawned the app once, and exited 1 every other time.
     (TMP / "ios-open").write_text("")
     app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("enter")
     assert await settle(pilot, lambda: ios.term.argv[:1] == ["objection"], tries=300), ios.term.argv
     assert ios.term.argv == ["objection", "-S", IOS_UDID, "-n", "4321", "start"], ios.term.argv
     assert "com.target.ios" in ios.term.label, ios.term.label
@@ -4828,6 +5311,8 @@ async def phase_ios(app, pilot) -> None:
     (TMP / "ios-running").unlink(missing_ok=True)
     began = time.monotonic()
     app.action_objection()
+    assert await on_screen(pilot, app, moabile.ObjectionArgsScreen)
+    await pilot.press("enter")
     assert await settle(pilot, lambda: "cannot be started from here" in log_text(ios),
                         tries=200), log_text(ios)
     assert time.monotonic() - began < 5, "waited for a launch that was never asked for"
@@ -5450,16 +5935,17 @@ async def main() -> None:
                 assert hasattr(cls_screen, f"action_{binding.action}"), (cls_screen.__name__, binding.action)
     app_bindings = [b for b in moabile.MOABile.BINDINGS if isinstance(b, moabile.Binding)]
     assert {b.key for b in app_bindings} == {
-        "r", "b", "f", "s", "o", "w", "t", "l", "slash", "c", "alt+c", "f8", "d", "a", "e", "x", "i", "u", "p", "k", "v",
-        "m", "h", "q"}
+        "r", "b", "f", "s", "o", "w", "t", "l", "slash", "f8", "d", "a", "e",
+        "x", "i", "u", "p", "k", "v", "m", "h", "q",
+    }
     # A key that stands for nothing in the word beside it has to be memorised
     # twice, so the bar is built the other way round: the label is chosen to
-    # start with its key. Three cannot — b for the sidebar's bar, v for svg, d
-    # for files — and k for clear is the plain shell convention.
+    # start with its key. Those that cannot: b for sidebar, slash for log filter,
+    # f8 for leave terminal, d for files, x for wipe, k for clear, and v for svg.
     off = [(b.key, b.description) for b in app_bindings
            if not b.description.startswith(b.key)]
     assert off == [
-        ("b", "sidebar"), ("slash", "log filter"), ("alt+c", "copy terminal"),
+        ("b", "sidebar"), ("slash", "log filter"),
         ("f8", "leave terminal"), ("d", "files"), ("x", "wipe"), ("k", "clear"), ("v", "svg"),
     ], off
     # The bar has room for a word each, so the whole sentence lives in the
